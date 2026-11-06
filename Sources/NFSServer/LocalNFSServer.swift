@@ -44,7 +44,7 @@ public enum NFSMount {
             // Soft mount with retries so a network outage returns errors instead of hanging Finder.
             "soft", "intr", "timeo=100", "retrans=3", "retrycnt=0",
             "rsize=1048576", "wsize=1048576", "readahead=16",
-            "actimeo=5", "nobrowse",
+            "actimeo=5",
         ]
         try run("/sbin/mount_nfs", ["-o", options.joined(separator: ","), "127.0.0.1:/", directory.path])
     }
