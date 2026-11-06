@@ -16,6 +16,6 @@ let package = Package(
         // Sample volume for website screenshots; not part of the app.
         .executableTarget(name: "demo-volume", dependencies: ["NFSServer"]),
         .testTarget(name: "NFSServerTests", dependencies: ["NFSServer"]),
-        .testTarget(name: "StreamDiskCoreTests", dependencies: ["StreamDiskCore"]),
+        .testTarget(name: "StreamDiskCoreTests", dependencies: ["StreamDiskCore", "NFSServer"]),
     ]
 )
