@@ -74,7 +74,7 @@ public enum DriveError: Error, CustomStringConvertible {
 public struct DriveClient: Sendable {
     public static let appFolderName = "StreamDisk"
 
-    let auth: GoogleAuth
+    public let auth: GoogleAuth
     let session: URLSession
     private let api = URL(string: "https://www.googleapis.com/drive/v3")!
     private let uploadAPI = URL(string: "https://www.googleapis.com/upload/drive/v3/files")!
@@ -103,6 +103,11 @@ public struct DriveClient: Sendable {
         let found = try await query(q, orderBy: "createdTime")
         if let existing = found.first { return existing }
         return try await createFolder(named: Self.appFolderName, in: "root")
+    }
+
+    /// The top of My Drive. Only reachable with full Drive access.
+    public func myDrive() async throws -> DriveFile {
+        try await file("root")
     }
 
     public func children(of folderID: String) async throws -> [DriveFile] {

@@ -5,7 +5,7 @@ import StreamDiskCore
 let usage = """
     usage: streamdisk <command>
 
-      login [--client <oauth_client.json>]   sign in to Google Drive
+      login [--full] [--client <file>]       sign in to Google Drive; --full shows your whole Drive
       logout                                 sign out and revoke access
       ls [folder]                            list files in your StreamDisk folder
       put <file>... [--to <folder>]          upload files
@@ -26,9 +26,14 @@ func signedInDrive() async throws -> DriveClient {
     return DriveClient(auth: auth)
 }
 
-/// Walks slash-separated folder names below the app folder.
+/// The folder StreamDisk shows: My Drive with full access, otherwise the app's own folder.
+func topFolder(_ drive: DriveClient) async throws -> DriveFile {
+    await drive.auth.hasFullDriveAccess ? try await drive.myDrive() : try await drive.appFolder()
+}
+
+/// Walks slash-separated folder names below the top folder.
 func resolveFolder(_ path: String?, in drive: DriveClient, create: Bool) async throws -> DriveFile {
-    var folder = try await drive.appFolder()
+    var folder = try await topFolder(drive)
     for part in (path ?? "").split(separator: "/").map(String.init) {
         let children = try await drive.children(of: folder.id)
         if let next = children.first(where: { $0.isFolder && $0.name == part }) {
@@ -58,15 +63,21 @@ func login(_ args: [String]) async throws {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dest.path)
     }
     let auth = try makeAuth()
+    let full = args.contains("--full")
     print("Opening Google sign-in in your browser…")
-    try await auth.signIn { url in
+    try await auth.signIn(fullDrive: full) { url in
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         p.arguments = [url.absoluteString]
         try? p.run()
     }
-    let folder = try await DriveClient(auth: auth).appFolder()
-    print("Signed in. Files go in “\(folder.name)” in your Google Drive.")
+    if await auth.hasFullDriveAccess {
+        print("Signed in with access to your whole Drive.")
+    } else {
+        let folder = try await DriveClient(auth: auth).appFolder()
+        print("Signed in. StreamDisk uses the “\(folder.name)” folder in your Google Drive.")
+        if full { print("Full Drive access was not granted, so only that folder is shown.") }
+    }
 }
 
 func list(_ args: [String]) async throws {
@@ -112,7 +123,7 @@ func put(_ args: [String]) async throws {
 func mount(_ args: [String]) async throws {
     let mountPoint = URL(fileURLWithPath: ((args.first ?? "~/StreamDisk") as NSString).expandingTildeInPath)
     let drive = try await signedInDrive()
-    let root = try await drive.appFolder()
+    let root = try await topFolder(drive)
     let fs = try DriveFileSystem(drive: drive, root: root)
     await fs.start()
     let server = try LocalNFSServer(backend: fs)

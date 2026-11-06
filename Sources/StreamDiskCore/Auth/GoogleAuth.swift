@@ -20,8 +20,13 @@ public enum AuthError: Error, Equatable, CustomStringConvertible {
 /// Google sign-in for installed apps (loopback redirect + PKCE) and access-token upkeep.
 /// The refresh token lives in the Keychain; access tokens only in memory.
 public actor GoogleAuth {
-    public static let scope = "https://www.googleapis.com/auth/drive.file"
+    /// Only files the app creates: the default, and the only scope Google lets a public app use
+    /// without a paid security assessment.
+    public static let appFilesScope = "https://www.googleapis.com/auth/drive.file"
+    /// The whole Drive. Opt-in.
+    public static let fullDriveScope = "https://www.googleapis.com/auth/drive"
     static let refreshAccount = "google.refresh-token"
+    static let scopesAccount = "google.granted-scopes"
 
     private let client: OAuthClient
     private let keychain: Keychain
@@ -39,8 +44,15 @@ public actor GoogleAuth {
         (try? keychain.read(Self.refreshAccount)) != nil
     }
 
+    /// Whether the user granted access to their whole Drive.
+    public var hasFullDriveAccess: Bool {
+        guard let data = try? keychain.read(Self.scopesAccount) else { return false }
+        return String(decoding: data, as: UTF8.self).split(separator: " ").contains { $0 == Self.fullDriveScope }
+    }
+
     /// Runs the browser sign-in. `open` is called with the Google consent URL.
-    public func signIn(open: @Sendable (URL) -> Void) async throws {
+    /// - Parameter fullDrive: Ask for the whole Drive instead of only the app's own files.
+    public func signIn(fullDrive: Bool = false, open: @Sendable (URL) -> Void) async throws {
         let receiver = try LoopbackReceiver(successPage: Self.successPage)
         defer { receiver.stop() }
         let redirectURI = try await receiver.start()
@@ -54,7 +66,7 @@ public actor GoogleAuth {
             .init(name: "client_id", value: client.clientID),
             .init(name: "redirect_uri", value: redirectURI.absoluteString),
             .init(name: "response_type", value: "code"),
-            .init(name: "scope", value: Self.scope),
+            .init(name: "scope", value: fullDrive ? Self.fullDriveScope : Self.appFilesScope),
             .init(name: "code_challenge", value: challenge),
             .init(name: "code_challenge_method", value: "S256"),
             .init(name: "state", value: state),
@@ -79,6 +91,8 @@ public actor GoogleAuth {
             throw AuthError.denied("Google did not return a refresh token")
         }
         try keychain.write(Data(refresh.utf8), for: Self.refreshAccount)
+        // The user can untick access on the consent screen, so record what was actually granted.
+        try keychain.write(Data((token.scope ?? "").utf8), for: Self.scopesAccount)
         cached = (token.access_token, Date().addingTimeInterval(TimeInterval(token.expires_in)))
     }
 
@@ -107,6 +121,7 @@ public actor GoogleAuth {
             _ = try? await session.data(for: req)
         }
         try keychain.delete(Self.refreshAccount)
+        try keychain.delete(Self.scopesAccount)
         cached = nil
     }
 
@@ -130,6 +145,7 @@ public actor GoogleAuth {
         let access_token: String
         let expires_in: Int
         let refresh_token: String?
+        let scope: String?
     }
 
     private func tokenRequest(_ fields: [String: String]) async throws -> TokenResponse {
