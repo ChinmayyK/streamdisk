@@ -1,0 +1,6 @@
+.build/
+.swiftpm/
+*.xcodeproj
+xcuserdata/
+.DS_Store
+oauth_client.json
