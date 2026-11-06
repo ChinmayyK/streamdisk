@@ -145,6 +145,7 @@ func mount(_ args: [String]) async throws {
     }
 }
 
+setvbuf(stdout, nil, _IOLBF, 0)
 let args = Array(CommandLine.arguments.dropFirst())
 do {
     switch args.first {
