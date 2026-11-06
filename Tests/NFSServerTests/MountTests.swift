@@ -47,10 +47,5 @@ struct MountTests {
         let values = try bigURL.resourceValues(forKeys: [.fileSizeKey, .totalFileAllocatedSizeKey])
         #expect(values.fileSize == big.count)
         #expect(values.totalFileAllocatedSize == 0)
-
-        // The volume is read-only for now.
-        #expect(throws: (any Error).self) {
-            try Data("x".utf8).write(to: mountPoint.appendingPathComponent("new.txt"))
-        }
     }
 }

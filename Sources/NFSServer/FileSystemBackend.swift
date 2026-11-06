@@ -95,3 +95,29 @@ public protocol FileSystemBackend: Sendable {
     func read(_ id: UInt64, offset: UInt64, count: Int) async throws -> [UInt8]
     func statistics() async throws -> VolumeStatistics
 }
+
+public enum CreateMode: Sendable, Equatable {
+    /// Create, or open an existing file.
+    case unchecked
+    /// Create; fail with `.exist` if the name is taken.
+    case guarded
+    /// Create once per verifier: a retried request with the same verifier succeeds again.
+    case exclusive(UInt64)
+}
+
+/// A backend that accepts changes. Methods throw `NFSStatus`; any other error is reported as `.io`.
+public protocol WritableFileSystemBackend: FileSystemBackend {
+    func create(_ name: String, in directory: UInt64, mode: CreateMode) async throws -> FileAttributes
+    /// Writes `data` at `offset`, extending the file if needed.
+    func write(_ id: UInt64, offset: UInt64, data: [UInt8]) async throws -> FileAttributes
+    /// Makes earlier writes durable on this Mac.
+    func commit(_ id: UInt64) async throws
+    /// Changes the size (truncating or extending with zeros) and/or modification date.
+    func setAttributes(_ id: UInt64, size: UInt64?, modified: Date?) async throws -> FileAttributes
+    func makeDirectory(_ name: String, in directory: UInt64) async throws -> FileAttributes
+    func remove(_ name: String, from directory: UInt64) async throws
+    /// Removes an empty directory; throws `.notEmpty` otherwise.
+    func removeDirectory(_ name: String, from directory: UInt64) async throws
+    /// Moves an entry, replacing a file of the target name (POSIX rename semantics).
+    func rename(_ name: String, from source: UInt64, to newName: String, in target: UInt64) async throws
+}

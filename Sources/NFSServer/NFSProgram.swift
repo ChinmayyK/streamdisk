@@ -30,6 +30,8 @@ public struct NFSProgram: RPCProgram {
 
     let backend: any FileSystemBackend
     let owner: (uid: UInt32, gid: UInt32)
+    /// Changes when the server restarts, telling clients to resend unstable writes.
+    let writeVerifier = UInt64.random(in: .min ... .max)
 
     public init(backend: any FileSystemBackend, uid: UInt32 = getuid(), gid: UInt32 = getgid()) {
         self.backend = backend
@@ -58,10 +60,13 @@ public struct NFSProgram: RPCProgram {
             case .fsinfo: return .success(try await fsinfo(&args))
             case .pathconf: return .success(try await pathconf(&args))
             case .readlink: return .success(failure(.notSupported, postOpAttrs: 1))
-            case .setattr, .write, .create, .mkdir, .symlink, .mknod, .remove, .rmdir, .commit:
-                return .success(failure(.rofs, wcc: 1))
-            case .rename: return .success(failure(.rofs, wcc: 2))
-            case .link: return .success(failure(.rofs, postOpAttrs: 1, wcc: 1))
+            case .symlink, .mknod: return .success(failure(.notSupported, wcc: 1))
+            case .link: return .success(failure(.notSupported, postOpAttrs: 1, wcc: 1))
+            case .setattr, .write, .create, .mkdir, .remove, .rmdir, .commit, .rename:
+                guard let writable = backend as? any WritableFileSystemBackend else {
+                    return .success(failure(.rofs, wcc: procedure == .rename ? 2 : 1))
+                }
+                return .success(try await handleWrite(procedure, &args, writable))
             }
         } catch is XDRError {
             return .garbageArguments
@@ -111,8 +116,9 @@ public struct NFSProgram: RPCProgram {
         var w = XDRWriter()
         do {
             let attrs = try await backend.attributes(of: id)
-            // READ | LOOKUP | EXECUTE. MODIFY, EXTEND and DELETE are never granted on a read-only volume.
-            let allowed: UInt32 = attrs.kind == .directory ? 0x01 | 0x02 | 0x20 : 0x01
+            // READ, LOOKUP and EXECUTE always; MODIFY, EXTEND and DELETE only when writable.
+            let write: UInt32 = backend is any WritableFileSystemBackend ? 0x04 | 0x08 | 0x10 : 0
+            let allowed: UInt32 = (attrs.kind == .directory ? 0x01 | 0x02 | 0x20 : 0x01) | write
             w.u32(NFSStatus.ok.rawValue)
             postOp(attrs, into: &w)
             w.u32(requested & allowed)
@@ -281,18 +287,18 @@ public struct NFSProgram: RPCProgram {
 
     // MARK: Encoding
 
-    private func handleArgument(_ args: inout XDRReader) throws -> UInt64 {
+    func handleArgument(_ args: inout XDRReader) throws -> UInt64 {
         let raw = try args.opaque(max: FileHandle.maxSize)
         // A malformed handle is a valid call with a bad handle, not garbage arguments.
         return (try? FileHandle.decode(raw)) ?? .max
     }
 
-    private func status(_ error: Error) -> NFSStatus {
+    func status(_ error: Error) -> NFSStatus {
         (error as? NFSStatus) ?? .io
     }
 
     /// Failure body for procedures whose error result is only empty attribute blocks.
-    private func failure(_ status: NFSStatus, postOpAttrs: Int = 0, wcc: Int = 0) -> XDRWriter {
+    func failure(_ status: NFSStatus, postOpAttrs: Int = 0, wcc: Int = 0) -> XDRWriter {
         var w = XDRWriter()
         w.u32(status.rawValue)
         for _ in 0..<postOpAttrs { w.bool(false) }
@@ -303,7 +309,7 @@ public struct NFSProgram: RPCProgram {
         return w
     }
 
-    private func postOp(_ attrs: FileAttributes?, into w: inout XDRWriter) {
+    func postOp(_ attrs: FileAttributes?, into w: inout XDRWriter) {
         guard let attrs else {
             w.bool(false)
             return
