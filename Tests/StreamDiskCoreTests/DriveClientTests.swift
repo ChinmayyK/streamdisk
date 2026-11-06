@@ -40,6 +40,14 @@ import Testing
         #expect(!DriveClient.isTransient(DriveError.http(status: 404, message: "")))
     }
 
+    @Test func cancellationIsNotRetried() {
+        #expect(!DriveClient.isTransient(URLError(.cancelled)))
+    }
+
+    @Test func formatsTimestampsAsRFC3339() {
+        #expect(DriveClient.timestamp(Date(timeIntervalSince1970: 1_793_980_661.5)) == "2026-11-06T15:57:41.500Z")
+    }
+
     @Test func escapesQueryLiterals() {
         #expect(DriveClient.escape("it's") == "it\\'s")
     }

@@ -189,33 +189,47 @@ public struct DriveClient: Sendable {
         throw DriveError.unexpectedResponse("asked for \(expected) bytes, got \(data.count) (\(response.statusCode))")
     }
 
+    /// Where an upload's content goes.
+    public enum UploadTarget: Sendable, Equatable {
+        /// A new file in a folder.
+        case new(name: String, parentID: String)
+        /// New content for an existing file, keeping its id.
+        case replace(fileID: String)
+    }
+
     /// Uploads a local file with Drive's resumable protocol, resuming within the session after
     /// network errors. `progress` receives bytes confirmed by the server.
     public func upload(_ fileURL: URL, name: String, to parentID: String,
                        progress: @Sendable (UInt64, UInt64) -> Void = { _, _ in }) async throws -> DriveFile {
+        try await upload(fileURL, to: .new(name: name, parentID: parentID), progress: progress)
+    }
+
+    /// Uploads `fileURL` to `target`.
+    /// - Parameters:
+    ///   - modified: Modification date to record on the Drive file.
+    ///   - session: A session URL from an earlier, interrupted upload of the same content.
+    ///   - onSession: Called with the session URL as soon as it exists, so a caller can persist it
+    ///     and resume after a restart. Sessions stay valid for about a week.
+    public func upload(_ fileURL: URL, to target: UploadTarget, modified: Date? = nil, session: URL? = nil,
+                       onSession: @Sendable (URL) -> Void = { _ in },
+                       progress: @Sendable (UInt64, UInt64) -> Void = { _, _ in }) async throws -> DriveFile {
         let total = try UInt64(fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
-        let metadata = try JSONSerialization.data(withJSONObject: ["name": name, "parents": [parentID]])
-        let start = uploadAPI.appending(queryItems: [
-            .init(name: "uploadType", value: "resumable"),
-            .init(name: "fields", value: DriveFile.fields),
-        ])
-        let (_, created) = try await send(expecting: [200]) {
-            var req = URLRequest(url: start)
-            req.httpMethod = "POST"
-            req.setValue("application/json; charset=UTF-8", forHTTPHeaderField: "Content-Type")
-            req.setValue(String(total), forHTTPHeaderField: "X-Upload-Content-Length")
-            req.httpBody = metadata
-            return req
-        }
-        guard let location = created.value(forHTTPHeaderField: "Location"), let sessionURL = URL(string: location) else {
-            throw DriveError.unexpectedResponse("resumable upload returned no session URL")
+        var offset: UInt64 = 0
+        var sessionURL: URL
+        // A session that already holds everything finished without us seeing the result; a fresh
+        // upload is simpler than recovering it, and rare.
+        if let session, let held = try? await uploadStatus(session, total: total), held < total || total == 0 {
+            sessionURL = session
+            offset = held
+        } else {
+            sessionURL = try await startUpload(to: target, total: total, modified: modified)
+            onSession(sessionURL)
         }
 
         let handle = try Foundation.FileHandle(forReadingFrom: fileURL)
         defer { try? handle.close() }
         // Chunks must be multiples of 256 KiB except the last.
         let chunkSize: UInt64 = 32 * 256 * 1024
-        var offset: UInt64 = 0
         var failures = 0
         while true {
             let end = min(offset + chunkSize, total)
@@ -244,6 +258,78 @@ public struct DriveClient: Sendable {
                 offset = try await uploadStatus(sessionURL, total: total)
             }
         }
+    }
+
+    private func startUpload(to target: UploadTarget, total: UInt64, modified: Date?) async throws -> URL {
+        var metadata: [String: Any] = [:]
+        let url: URL
+        let method: String
+        switch target {
+        case .new(let name, let parentID):
+            metadata["name"] = name
+            metadata["parents"] = [parentID]
+            url = uploadAPI
+            method = "POST"
+        case .replace(let fileID):
+            url = uploadAPI.appendingPathComponent(fileID)
+            method = "PATCH"
+        }
+        if let modified { metadata["modifiedTime"] = Self.timestamp(modified) }
+        let body = try JSONSerialization.data(withJSONObject: metadata)
+        let start = url.appending(queryItems: [
+            .init(name: "uploadType", value: "resumable"),
+            .init(name: "fields", value: DriveFile.fields),
+        ])
+        let (_, created) = try await send(expecting: [200]) {
+            var req = URLRequest(url: start)
+            req.httpMethod = method
+            req.setValue("application/json; charset=UTF-8", forHTTPHeaderField: "Content-Type")
+            req.setValue(String(total), forHTTPHeaderField: "X-Upload-Content-Length")
+            req.httpBody = body
+            return req
+        }
+        guard let location = created.value(forHTTPHeaderField: "Location"), let sessionURL = URL(string: location) else {
+            throw DriveError.unexpectedResponse("resumable upload returned no session URL")
+        }
+        return sessionURL
+    }
+
+    /// Renames, moves and/or re-dates a file or folder.
+    public func update(_ fileID: String, name: String? = nil, moveFrom oldParent: String? = nil,
+                       to newParent: String? = nil, modified: Date? = nil) async throws -> DriveFile {
+        var items: [URLQueryItem] = [.init(name: "fields", value: DriveFile.fields)]
+        if let newParent, let oldParent, newParent != oldParent {
+            items.append(.init(name: "addParents", value: newParent))
+            items.append(.init(name: "removeParents", value: oldParent))
+        }
+        var metadata: [String: Any] = [:]
+        if let name { metadata["name"] = name }
+        if let modified { metadata["modifiedTime"] = Self.timestamp(modified) }
+        return try await patch(fileID, metadata, query: items)
+    }
+
+    /// Moves a file or folder to Drive's trash, where it can be restored for 30 days.
+    public func trash(_ fileID: String) async throws {
+        _ = try await patch(fileID, ["trashed": true], query: [.init(name: "fields", value: DriveFile.fields)])
+    }
+
+    private func patch(_ fileID: String, _ metadata: [String: Any], query: [URLQueryItem]) async throws -> DriveFile {
+        let url = api.appendingPathComponent("files/\(fileID)").appending(queryItems: query)
+        let body = try JSONSerialization.data(withJSONObject: metadata)
+        let (data, _) = try await send(expecting: [200]) {
+            var req = URLRequest(url: url)
+            req.httpMethod = "PATCH"
+            req.setValue("application/json; charset=UTF-8", forHTTPHeaderField: "Content-Type")
+            req.httpBody = body
+            return req
+        }
+        return try Self.decoder.decode(DriveFile.self, from: data)
+    }
+
+    static func timestamp(_ date: Date) -> String {
+        // RFC 3339 in UTC, which is what Drive's modifiedTime expects.
+        date.formatted(.iso8601.year().month().day().dateSeparator(.dash).timeSeparator(.colon)
+            .dateTimeSeparator(.standard).time(includingFractionalSeconds: true).timeZone(separator: .omitted))
     }
 
     /// Asks the upload session how many bytes it already holds.
@@ -296,7 +382,7 @@ public struct DriveClient: Sendable {
     }
 
     static func isTransient(_ error: Error) -> Bool {
-        if error is URLError { return true }
+        if let e = error as? URLError { return e.code != .cancelled }
         guard case .http(let status, let message) = error as? DriveError else { return false }
         if [429, 500, 502, 503, 504].contains(status) { return true }
         return status == 403 && (message.contains("rateLimitExceeded") || message.contains("userRateLimitExceeded"))
