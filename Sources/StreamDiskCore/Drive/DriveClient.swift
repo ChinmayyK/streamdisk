@@ -169,6 +169,12 @@ public struct DriveClient: Sendable {
     public func download(_ fileID: String, range: Range<UInt64>) async throws -> Data {
         precondition(!range.isEmpty)
         let url = api.appendingPathComponent("files/\(fileID)").appending(queryItems: [.init(name: "alt", value: "media")])
+        let started = ContinuousClock.now
+        defer {
+            let ms = (ContinuousClock.now - started).components.attoseconds / 1_000_000_000_000_000
+                + (ContinuousClock.now - started).components.seconds * 1000
+            log.debug("download \(fileID, privacy: .public) \(range.lowerBound)+\(range.count) in \(ms) ms")
+        }
         let (data, response) = try await send(expecting: [200, 206]) {
             var req = URLRequest(url: url)
             req.setValue("bytes=\(range.lowerBound)-\(range.upperBound - 1)", forHTTPHeaderField: "Range")
