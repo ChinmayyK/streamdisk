@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>StreamDisk: Google Drive as a disk on your Mac</title>
+  <meta name="description" content="StreamDisk mounts your Google Drive in Finder. Files keep their full size but take no space on your Mac, and stream when you open them.">
+  <meta name="color-scheme" content="dark light">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="nav">
+    <div class="wrap nav-inner">
+      <a class="brand" href="/">StreamDisk</a>
+      <nav aria-label="Primary">
+        <a href="#how">How it works</a>
+        <a href="https://github.com/ChinmayyK/streamdisk">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero wrap">
+      <div class="hero-copy">
+        <h1>Your Google Drive, as a disk on your Mac.</h1>
+        <p class="lede">Files show up in Finder at full size and take no space. Open one and it streams.</p>
+        <div class="actions">
+          <a class="button primary" href="https://github.com/ChinmayyK/streamdisk">Get StreamDisk</a>
+          <a class="button ghost" href="#how">How it works</a>
+        </div>
+      </div>
+      <figure class="hero-shot">
+        <picture>
+          <source media="(max-width: 860px)" srcset="assets/finder-list-narrow.png" width="480" height="253">
+          <img src="assets/finder-list.png" width="700" height="253"
+             alt="A Finder window named StreamDisk listing large files: a 128.6 GB interview, an 87.22 GB Lightroom catalog and a 61.37 GB 4K ride video.">
+        </picture>
+      </figure>
+    </section>
+
+    <section class="weight wrap">
+      <figure class="info-shot">
+        <img src="assets/get-info.png" width="530" height="372"
+             alt="Finder's Get Info for Ladakh ride 4K.mov: size 61.37 GB, zero bytes on disk.">
+      </figure>
+      <div class="weight-copy">
+        <h2>A 61 GB film. Zero bytes on disk.</h2>
+        <p>Your files stay in Google Drive. Your Mac only knows their names and sizes until an app reads them, and then it fetches just the part being read.</p>
+      </div>
+    </section>
+
+    <section class="how wrap" id="how">
+      <h2>Three things to do, once.</h2>
+      <ol class="steps">
+        <li>
+          <h3>Sign in with Google</h3>
+          <p>StreamDisk asks for access only to the files it adds to your Drive. The rest of your Drive stays out of reach.</p>
+        </li>
+        <li>
+          <h3>Move big folders in</h3>
+          <p>They upload in the background to a StreamDisk folder in your Drive, and the space comes back to your Mac.</p>
+        </li>
+        <li>
+          <h3>Open files where they are</h3>
+          <p>Double-click in Finder. QuickTime, IINA, VLC, Final Cut and every other app read the file like any other disk.</p>
+        </li>
+      </ol>
+    </section>
+
+    <section class="speed wrap">
+      <p class="speed-figure"><span>1.7</span> seconds</p>
+      <div class="speed-copy">
+        <h2>Fast on an ordinary connection.</h2>
+        <p>That is how long a 1080p video took to open on a 28 Mbps home line. The bytes a player is waiting for always download first, and the next part of the file is fetched while you watch.</p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
