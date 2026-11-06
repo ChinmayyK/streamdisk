@@ -13,6 +13,8 @@ let package = Package(
         // Google Drive client, auth, chunk cache, and the Drive-backed file system.
         .target(name: "StreamDiskCore", dependencies: ["NFSServer"]),
         .executableTarget(name: "streamdisk", dependencies: ["StreamDiskCore", "NFSServer"]),
+        // Sample volume for website screenshots; not part of the app.
+        .executableTarget(name: "demo-volume", dependencies: ["NFSServer"]),
         .testTarget(name: "NFSServerTests", dependencies: ["NFSServer"]),
         .testTarget(name: "StreamDiskCoreTests", dependencies: ["StreamDiskCore"]),
     ]
