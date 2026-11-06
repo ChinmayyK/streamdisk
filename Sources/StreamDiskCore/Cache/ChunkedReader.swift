@@ -17,10 +17,13 @@ public struct RemoteFile: Sendable, Hashable {
 /// Serves byte ranges of remote files from a bounded in-memory cache of fixed-size chunks.
 ///
 /// Tuned for how media players read:
-/// - The first read of a file also fetches its last chunk, where MP4/MOV `moov` atoms and MKV
-///   cues often live, so the player's jump to the end does not stall.
-/// - Sequential reads grow a readahead window (up to `maxReadahead` chunks) so playback stays
-///   ahead of the decoder; a seek resets it.
+/// - Downloads go through a `DownloadGate`: a few at a time, with chunks a reader is blocked on
+///   ahead of readahead, and earlier chunks ahead of later ones. Starting everything at once
+///   would split the link and make the chunk the player needs arrive last.
+/// - The first read of a file also fetches its tail urgently, where MP4/MOV `moov` atoms and
+///   MKV cues often live, so the player's jump to the end does not stall.
+/// - Sequential reads grow a readahead window up to `maxReadahead` chunks. A seek resets it and
+///   drops queued readahead that is no longer useful.
 /// - Concurrent requests for the same chunk share one download.
 public actor ChunkedReader {
     public typealias Fetch = @Sendable (_ file: RemoteFile, _ range: Range<UInt64>) async throws -> Data
@@ -40,22 +43,42 @@ public actor ChunkedReader {
         var window: Int
     }
 
+    private struct Download {
+        let id: Int
+        let task: Task<Data, Error>
+        var urgent: Bool
+    }
+
+    /// A queued readahead was abandoned after a seek.
+    struct Dropped: Error {}
+
+    struct ShortChunk: Error, CustomStringConvertible {
+        let expected: Int
+        let got: Int
+        var description: String { "expected \(expected) bytes, got \(got)" }
+    }
+
     private let fetch: Fetch
+    private let gate: DownloadGate
     private var chunks: [Key: (data: Data, tick: UInt64)] = [:]
     private var bytes = 0
     private var tick: UInt64 = 0
-    private var inflight: [Key: Task<Data, Error>] = [:]
+    private var inflight: [Key: Download] = [:]
+    private var nextDownloadID = 0
     private var streams: [String: Stream] = [:]
 
     /// - Parameters:
     ///   - chunkSize: Download and cache unit.
     ///   - capacity: Cache budget in bytes; least recently used chunks are dropped past it.
     ///   - maxReadahead: Most chunks fetched ahead of a sequential reader.
-    public init(chunkSize: UInt64 = 4 << 20, capacity: Int = 256 << 20, maxReadahead: Int = 8, fetch: @escaping Fetch) {
+    ///   - concurrency: Downloads in flight at once.
+    public init(chunkSize: UInt64 = 1 << 20, capacity: Int = 256 << 20, maxReadahead: Int = 32,
+                concurrency: Int = 6, fetch: @escaping Fetch) {
         precondition(chunkSize > 0 && capacity >= Int(chunkSize))
         self.chunkSize = chunkSize
         self.capacity = capacity
         self.maxReadahead = maxReadahead
+        self.gate = DownloadGate(limit: concurrency, reserved: concurrency > 1 ? 1 : 0)
         self.fetch = fetch
     }
 
@@ -66,18 +89,18 @@ public actor ChunkedReader {
         let first = offset / chunkSize
         let last = (end - 1) / chunkSize
 
-        noteAccess(file, first: first, last: last)
+        // Request what this read needs before scheduling readahead, so it queues first.
+        var tasks: [Task<Data, Error>] = []
+        for i in first...last { tasks.append(await task(for: file, index: i, urgent: true)) }
+        await noteAccess(file, first: first, last: last)
 
-        // Start every needed chunk before awaiting any, so a read spanning two chunks fetches both at once.
-        let tasks = (first...last).map { task(for: file, index: $0) }
         var out = [UInt8]()
         out.reserveCapacity(Int(end - offset))
         for (i, t) in zip(first...last, tasks) {
-            let data = try await t.value
+            let data = try await value(of: t, file: file, index: i)
             let chunkStart = i * chunkSize
             let lo = Int(max(offset, chunkStart) - chunkStart)
             let hi = Int(min(end, chunkStart + UInt64(data.count)) - chunkStart)
-            guard lo <= hi else { throw NSError(domain: "StreamDisk", code: 1, userInfo: [NSLocalizedDescriptionKey: "short chunk"]) }
             out.append(contentsOf: data[data.startIndex + lo..<data.startIndex + hi])
         }
         return out
@@ -92,82 +115,121 @@ public actor ChunkedReader {
     }
 
     var cachedBytes: Int { bytes }
-    var cachedChunkCount: Int { chunks.count }
     func isCached(_ file: RemoteFile, index: UInt64) -> Bool {
         chunks[Key(file: file.id, version: file.version, index: index)] != nil
     }
 
     // MARK: Readahead
 
-    private func noteAccess(_ file: RemoteFile, first: UInt64, last: UInt64) {
+    private func noteAccess(_ file: RemoteFile, first: UInt64, last: UInt64) async {
         let lastChunk = (file.size - 1) / chunkSize
         guard let s = streams[file.id] else {
-            // First touch: header is being read now; fetch the tail and the next chunk too.
-            streams[file.id] = Stream(lastIndex: last, window: 1)
-            prefetch(file, index: lastChunk)
-            prefetch(file, index: last + 1)
+            // First touch: the header is being read; fetch the tail urgently and start readahead.
+            let window = min(maxReadahead, 4)
+            streams[file.id] = Stream(lastIndex: last, window: window)
+            let tailStart = max(last + 1, lastChunk > 0 ? lastChunk - 1 : 0)
+            for i in stride(from: tailStart, through: lastChunk, by: 1) {
+                // Players need the index at the end as soon as the header, so rank it with chunk 0.
+                _ = await task(for: file, index: i, urgent: true, rank: 0)
+            }
+            await readahead(file, after: last, window: window, lastChunk: lastChunk)
             return
         }
-        let sequential = first == s.lastIndex || first == s.lastIndex + 1
-        let window = sequential ? min(maxReadahead, s.window * 2) : 1
+        let sequential = first >= s.lastIndex && first <= s.lastIndex + 1
+        let window = sequential ? min(maxReadahead, max(1, s.window) * 2) : min(maxReadahead, 4)
         streams[file.id] = Stream(lastIndex: last, window: window)
-        for i in stride(from: last + 1, through: min(lastChunk, last + UInt64(window)), by: 1) {
-            prefetch(file, index: i)
+        if !sequential {
+            // Seek: queued readahead elsewhere in the file would only delay the new position.
+            // Queued ones are dropped; running ones are cancelled so they stop using bandwidth.
+            let keep = first...(last + UInt64(window))
+            await gate.drop(group: file.id) { keep.contains($0) }
+            for (key, d) in inflight where key.file == file.id && !d.urgent && !keep.contains(key.index) {
+                d.task.cancel()
+            }
         }
+        await readahead(file, after: last, window: window, lastChunk: lastChunk)
     }
 
-    private func prefetch(_ file: RemoteFile, index: UInt64) {
-        guard index * chunkSize < file.size else { return }
-        _ = task(for: file, index: index)
+    private func readahead(_ file: RemoteFile, after last: UInt64, window: Int, lastChunk: UInt64) async {
+        guard window > 0, last < lastChunk else { return }
+        for i in (last + 1)...min(lastChunk, last + UInt64(window)) {
+            _ = await task(for: file, index: i, urgent: false)
+        }
     }
 
     // MARK: Cache
 
-    private func task(for file: RemoteFile, index: UInt64) -> Task<Data, Error> {
+    /// Awaits a chunk, re-requesting it if a queued prefetch it shared was dropped by a seek.
+    private func value(of first: Task<Data, Error>, file: RemoteFile, index: UInt64) async throws -> Data {
+        var t = first
+        for _ in 0..<3 {
+            do {
+                return try await t.value
+            } catch is Dropped {
+                t = await task(for: file, index: index, urgent: true)
+            } catch is CancellationError {
+                t = await task(for: file, index: index, urgent: true)
+            } catch let e as URLError where e.code == .cancelled {
+                t = await task(for: file, index: index, urgent: true)
+            }
+        }
+        return try await t.value
+    }
+
+    /// - Parameter rank: Position used to order downloads of equal urgency; defaults to `index`.
+    private func task(for file: RemoteFile, index: UInt64, urgent: Bool, rank: UInt64? = nil) async -> Task<Data, Error> {
         let key = Key(file: file.id, version: file.version, index: index)
         if let hit = chunks[key] {
             tick += 1
             chunks[key] = (hit.data, tick)
             return Task { hit.data }
         }
-        if let running = inflight[key] { return running }
+        let priority = DownloadGate.Priority(urgent: urgent, index: rank ?? index)
+        if let running = inflight[key] {
+            if urgent && !running.urgent {
+                inflight[key]?.urgent = true
+                await gate.promote(id: running.id, to: priority)
+            }
+            return running.task
+        }
 
+        nextDownloadID += 1
+        let id = nextDownloadID
         let start = index * chunkSize
         let range = start..<min(file.size, start + chunkSize)
         let fetch = self.fetch
+        let gate = self.gate
         let t = Task { [weak self] () throws -> Data in
+            guard await gate.acquire(id: id, group: file.id, priority: priority) else {
+                await self?.finish(key, id: id, data: nil)
+                throw Dropped()
+            }
+            let result: Result<Data, Error>
             do {
                 let data = try await fetch(file, range)
-                guard data.count == range.count else {
-                    throw NSError(domain: "StreamDisk", code: 2, userInfo: [
-                        NSLocalizedDescriptionKey: "expected \(range.count) bytes, got \(data.count)"])
-                }
-                await self?.store(key, data)
-                return data
+                result = data.count == range.count ? .success(data) : .failure(ShortChunk(expected: range.count, got: data.count))
             } catch {
-                await self?.dropInflight(key)
-                throw error
+                result = .failure(error)
             }
+            await gate.release(id: id)
+            await self?.finish(key, id: id, data: try? result.get())
+            return try result.get()
         }
-        inflight[key] = t
+        inflight[key] = Download(id: id, task: t, urgent: urgent)
         return t
     }
 
-    private func store(_ key: Key, _ data: Data) {
-        inflight[key] = nil
+    private func finish(_ key: Key, id: Int, data: Data?) {
+        if inflight[key]?.id == id { inflight[key] = nil }
+        guard let data else { return }
         tick += 1
         if let old = chunks.updateValue((data, tick), forKey: key) { bytes -= old.data.count }
         bytes += data.count
         evict()
     }
 
-    private func dropInflight(_ key: Key) {
-        inflight[key] = nil
-    }
-
     private func evict() {
         guard bytes > capacity else { return }
-        // Few dozen entries at most, so a sort beats maintaining a linked list.
         for (key, value) in chunks.sorted(by: { $0.value.tick < $1.value.tick }) {
             guard bytes > capacity else { break }
             chunks[key] = nil

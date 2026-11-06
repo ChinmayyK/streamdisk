@@ -43,7 +43,10 @@ public enum NFSMount {
             "locallocks", "noresvport",
             // Soft mount with retries so a network outage returns errors instead of hanging Finder.
             "soft", "intr", "timeo=100", "retrans=3", "retrycnt=0",
-            "rsize=1048576", "wsize=1048576", "readahead=16",
+            "rsize=1048576", "wsize=1048576",
+            // The server does the real readahead from Drive; client readahead only pulls ahead
+            // from its memory, and a large value floods the server with requests it must treat as urgent.
+            "readahead=2",
             "actimeo=5",
         ]
         try run("/sbin/mount_nfs", ["-o", options.joined(separator: ","), "127.0.0.1:/", directory.path])
