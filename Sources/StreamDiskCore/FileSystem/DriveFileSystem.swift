@@ -2,18 +2,23 @@ import Foundation
 import NFSServer
 import os
 
-/// Exposes the app's Drive folder as a `FileSystemBackend`: metadata from cached folder
-/// listings, content streamed through `ChunkedReader`.
-public actor DriveFileSystem: FileSystemBackend {
+/// Exposes the app's Drive folder as a writable file system.
+///
+/// Reads stream from Drive through `ChunkedReader`. Writes go to a local staging file and upload
+/// once the file has been quiet for a moment (see `UploadQueue`); until then the staged copy is
+/// what Finder sees. A journal on disk records staged files, so uploads resume after a restart.
+/// Deletes move items to Drive's trash.
+public actor DriveFileSystem: WritableFileSystemBackend {
     public nonisolated let rootID: UInt64 = 1
 
     /// How long a folder listing is trusted before it is fetched again.
     let listingTTL: TimeInterval
 
     private struct Node {
-        let file: DriveFile
-        let parent: UInt64
-        let name: String
+        var name: String
+        var parent: UInt64
+        /// Nil for a file that has not been uploaded yet.
+        var remote: DriveFile?
     }
 
     private struct Folder {
@@ -23,30 +28,78 @@ public actor DriveFileSystem: FileSystemBackend {
         var version: UInt64
     }
 
-    private let drive: DriveClient
+    /// Written content waiting to upload (or kept local, for Finder's metadata files).
+    struct Pending: Codable {
+        var name: String
+        var parentDriveID: String
+        var staging: String
+        /// The Drive file this content replaces; nil for a new file.
+        var driveID: String?
+        var modified: Date
+        var session: URL?
+        var localOnly: Bool
+        var verifier: UInt64?
+    }
+
+    private let drive: any DriveService
     private let reader: ChunkedReader
+    private let staging: StagingStore
+    private let uploads: UploadQueue
+    private let journalURL: URL
     private let log = Logger(subsystem: "app.streamdisk", category: "fs")
     private var nodes: [UInt64: Node] = [:]
     private var idByDriveID: [String: UInt64] = [:]
     private var folders: [UInt64: Folder] = [:]
     private var listing: [UInt64: Task<Void, Error>] = [:]
+    private var materializing: [UInt64: Task<String, Error>] = [:]
+    private var pending: [UInt64: Pending] = [:]
     private var quota: (value: DriveQuota, fetched: Date)?
 
-    public init(drive: DriveClient, root: DriveFile, cacheBytes: Int = 256 << 20, listingTTL: TimeInterval = 15) {
+    /// - Parameters:
+    ///   - stateDirectory: Holds the staging files and the journal.
+    ///   - uploadDelay: How long a file must go without writes before it uploads.
+    public init(drive: any DriveService, root: DriveFile, stateDirectory: URL = AppPaths.support,
+                cacheBytes: Int = 256 << 20, listingTTL: TimeInterval = 15,
+                uploadDelay: Duration = .seconds(2)) throws {
         self.drive = drive
         self.listingTTL = listingTTL
         self.reader = ChunkedReader(capacity: cacheBytes) { file, range in
             try await drive.download(file.id, range: range)
         }
-        nodes[rootID] = Node(file: root, parent: rootID, name: "")
+        self.staging = try StagingStore(directory: stateDirectory.appendingPathComponent("Staging"))
+        self.uploads = UploadQueue(quiet: uploadDelay)
+        self.journalURL = stateDirectory.appendingPathComponent("pending.json")
+        nodes[rootID] = Node(name: "", parent: rootID, remote: root)
         idByDriveID[root.id] = rootID
+
+        if let data = try? Data(contentsOf: journalURL),
+           let saved = try? JSONDecoder().decode([UInt64: Pending].self, from: data) {
+            pending = saved
+        }
+        staging.removeAll(except: Set(pending.values.map(\.staging)))
     }
 
-    // MARK: FileSystemBackend
+    /// Starts uploading, including anything left over from the last run.
+    public func start() async {
+        await uploads.start { [weak self] id in try await self?.upload(id) }
+        for (id, p) in pending where !p.localOnly { await uploads.enqueue(id) }
+    }
+
+    /// Files written but not yet uploaded.
+    public var uploadsWaiting: Int { pending.values.filter { !$0.localOnly }.count }
+
+    // MARK: Reading
 
     public func attributes(of id: UInt64) async throws -> FileAttributes {
-        guard let node = nodes[id] else { throw NFSStatus.stale }
-        return attributes(id, node.file)
+        if let p = pending[id] {
+            let size = try staging.size(p.staging)
+            // Staged content really is on this Mac until it uploads.
+            return FileAttributes(id: id, kind: .file, size: size, bytesOnDisk: size, modified: p.modified)
+        }
+        guard let remote = nodes[id]?.remote else { throw NFSStatus.stale }
+        return FileAttributes(id: id, kind: remote.isFolder ? .directory : .file,
+                              size: remote.isFolder ? 0 : remote.size, bytesOnDisk: 0,
+                              modified: remote.modifiedTime, changed: remote.modifiedTime)
     }
 
     public func lookup(_ name: String, in directory: UInt64) async throws -> FileAttributes {
@@ -55,24 +108,27 @@ public actor DriveFileSystem: FileSystemBackend {
             return try await attributes(of: node.parent)
         }
         let folder = try await folder(directory)
-        guard let id = folder.children[name], let node = nodes[id] else { throw NFSStatus.noent }
-        return attributes(id, node.file)
+        guard let id = folder.children[name] else { throw NFSStatus.noent }
+        return try await attributes(of: id)
     }
 
     public func list(_ directory: UInt64) async throws -> DirectoryListing {
         let folder = try await folder(directory)
-        let entries = folder.ordered.compactMap { id in
-            nodes[id].map { DirectoryEntry(name: $0.name, attributes: attributes(id, $0.file)) }
+        var entries: [DirectoryEntry] = []
+        for id in folder.ordered {
+            guard let node = nodes[id], let attrs = try? await attributes(of: id) else { continue }
+            entries.append(DirectoryEntry(name: node.name, attributes: attrs))
         }
         return DirectoryListing(entries: entries, version: folder.version)
     }
 
     public func read(_ id: UInt64, offset: UInt64, count: Int) async throws -> [UInt8] {
-        guard let node = nodes[id] else { throw NFSStatus.stale }
-        guard !node.file.isFolder else { throw NFSStatus.isdir }
-        let remote = RemoteFile(id: node.file.id, version: Self.version(of: node.file), size: node.file.size)
+        if let p = pending[id] { return try staging.read(p.staging, offset: offset, count: count) }
+        guard let node = nodes[id], let remote = node.remote else { throw NFSStatus.stale }
+        guard !remote.isFolder else { throw NFSStatus.isdir }
+        let file = RemoteFile(id: remote.id, version: Self.version(of: remote), size: remote.size)
         do {
-            return try await reader.read(remote, offset: offset, count: count)
+            return try await reader.read(file, offset: offset, count: count)
         } catch {
             log.error("read \(node.name, privacy: .public) @\(offset) failed: \(String(describing: error), privacy: .public)")
             throw Self.status(for: error)
@@ -89,18 +145,250 @@ public actor DriveFileSystem: FileSystemBackend {
         return VolumeStatistics(totalBytes: total, freeBytes: total > q.usage ? total - q.usage : 0)
     }
 
+    // MARK: Writing
+
+    public func create(_ name: String, in directory: UInt64, mode: CreateMode) async throws -> FileAttributes {
+        let folder = try await folder(directory)
+        if let existing = folder.children[name] {
+            switch mode {
+            case .unchecked: return try await attributes(of: existing)
+            case .guarded: throw NFSStatus.exist
+            case .exclusive(let v):
+                guard pending[existing]?.verifier == v else { throw NFSStatus.exist }
+                return try await attributes(of: existing)
+            }
+        }
+        let parentDriveID = try driveID(ofFolder: directory)
+        var verifier: UInt64?
+        if case .exclusive(let v) = mode { verifier = v }
+        let id = newNodeID()
+        pending[id] = Pending(name: name, parentDriveID: parentDriveID, staging: try staging.create(),
+                              driveID: nil, modified: Date(), session: nil,
+                              localOnly: Self.isLocalOnly(name), verifier: verifier)
+        nodes[id] = Node(name: name, parent: directory, remote: nil)
+        insert(id, named: name, in: directory)
+        saveJournal()
+        await changed(id)
+        return try await attributes(of: id)
+    }
+
+    public func write(_ id: UInt64, offset: UInt64, data: [UInt8]) async throws -> FileAttributes {
+        let name = try await stage(id)
+        try staging.write(name, offset: offset, data: data)
+        pending[id]?.modified = Date()
+        await changed(id)
+        return try await attributes(of: id)
+    }
+
+    public func commit(_ id: UInt64) async throws {
+        if let p = pending[id] { try staging.sync(p.staging) }
+    }
+
+    public func setAttributes(_ id: UInt64, size: UInt64?, modified: Date?) async throws -> FileAttributes {
+        guard let node = nodes[id] else { throw NFSStatus.stale }
+        if let size {
+            if node.remote?.isFolder == true { throw NFSStatus.isdir }
+            if pending[id] == nil, size == 0 {
+                // Truncating to empty (how most apps start a save) needs none of the old content.
+                try stageEmpty(id)
+                await changed(id)
+            } else if pending[id] != nil || size != node.remote?.size {
+                let name = try await stage(id)
+                try staging.truncate(name, to: size)
+                await changed(id)
+            }
+        }
+        if let modified {
+            if pending[id] != nil {
+                pending[id]?.modified = modified
+                saveJournal()
+            } else if let remote = node.remote {
+                nodes[id]?.remote = try await call { try await self.drive.update(remote.id, name: nil, moveFrom: nil, to: nil, modified: modified) }
+            }
+        }
+        return try await attributes(of: id)
+    }
+
+    public func makeDirectory(_ name: String, in directory: UInt64) async throws -> FileAttributes {
+        let folder = try await folder(directory)
+        guard folder.children[name] == nil else { throw NFSStatus.exist }
+        // macOS housekeeping folders would only clutter Drive.
+        guard !Self.refusedDirectories.contains(name) else { throw NFSStatus.acces }
+        let parentDriveID = try driveID(ofFolder: directory)
+        let created = try await call { try await self.drive.createFolder(named: Self.driveName(name), in: parentDriveID) }
+        let id = nodeID(for: created.id)
+        nodes[id] = Node(name: name, parent: directory, remote: created)
+        folders[id] = Folder(children: [:], ordered: [], fetched: Date(), version: 1)
+        insert(id, named: name, in: directory)
+        return try await attributes(of: id)
+    }
+
+    public func remove(_ name: String, from directory: UInt64) async throws {
+        let folder = try await folder(directory)
+        guard let id = folder.children[name] else { throw NFSStatus.noent }
+        if nodes[id]?.remote?.isFolder == true { throw NFSStatus.isdir }
+        try await discard(id)
+        removeChild(named: name, from: directory)
+    }
+
+    public func removeDirectory(_ name: String, from directory: UInt64) async throws {
+        let folder = try await folder(directory)
+        guard let id = folder.children[name] else { throw NFSStatus.noent }
+        guard let remote = nodes[id]?.remote, remote.isFolder else { throw NFSStatus.notdir }
+        guard try await self.folder(id).ordered.isEmpty else { throw NFSStatus.notEmpty }
+        try await call { try await self.drive.trash(remote.id) }
+        folders[id] = nil
+        removeChild(named: name, from: directory)
+    }
+
+    public func rename(_ name: String, from source: UInt64, to newName: String, in target: UInt64) async throws {
+        guard let id = try await folder(source).children[name] else { throw NFSStatus.noent }
+        let targetDriveID = try driveID(ofFolder: target)
+        if let existing = try await folder(target).children[newName], existing != id {
+            // POSIX rename replaces a file; this is how apps save atomically.
+            guard nodes[existing]?.remote?.isFolder != true else { throw NFSStatus.exist }
+            try await discard(existing)
+            removeChild(named: newName, from: target)
+        }
+        if var p = pending[id], p.driveID == nil {
+            // Not uploaded yet: only the plan changes.
+            p.name = newName
+            p.parentDriveID = targetDriveID
+            p.localOnly = Self.isLocalOnly(newName)
+            pending[id] = p
+            saveJournal()
+            if p.localOnly { await uploads.cancel(id) } else { await uploads.touch(id) }
+        } else if let remote = nodes[id]?.remote {
+            let sourceDriveID = try driveID(ofFolder: source)
+            nodes[id]?.remote = try await call {
+                try await self.drive.update(remote.id, name: newName == name ? nil : Self.driveName(newName),
+                                            moveFrom: sourceDriveID, to: targetDriveID, modified: nil)
+            }
+            if pending[id] != nil {
+                pending[id]?.name = newName
+                pending[id]?.parentDriveID = targetDriveID
+                saveJournal()
+            }
+        }
+        nodes[id]?.name = newName
+        nodes[id]?.parent = target
+        removeChild(named: name, from: source)
+        insert(id, named: newName, in: target)
+    }
+
+    // MARK: Staging and upload
+
+    /// Makes sure `id` has staged content, downloading the current Drive content first.
+    /// Editing part of a large remote file in place therefore downloads all of it; apps that
+    /// save by rewriting the whole file (most of them) never hit this path.
+    private func stage(_ id: UInt64) async throws -> String {
+        if let p = pending[id] { return p.staging }
+        if let running = materializing[id] { return try await running.value }
+        guard let node = nodes[id], let remote = node.remote else { throw NFSStatus.stale }
+        guard !remote.isFolder else { throw NFSStatus.isdir }
+        let parentDriveID = try driveID(ofFolder: node.parent)
+        let name = try staging.create()
+        let task = Task { [drive, staging] () throws -> String in
+            var offset: UInt64 = 0
+            while offset < remote.size {
+                let end = min(remote.size, offset + (8 << 20))
+                let data = try await drive.download(remote.id, range: offset..<end)
+                try staging.write(name, offset: offset, data: Array(data))
+                offset = end
+            }
+            return name
+        }
+        materializing[id] = task
+        defer { materializing[id] = nil }
+        do {
+            _ = try await task.value
+        } catch {
+            staging.delete(name)
+            throw Self.status(for: error)
+        }
+        pending[id] = Pending(name: node.name, parentDriveID: parentDriveID, staging: name, driveID: remote.id,
+                              modified: remote.modifiedTime, session: nil, localOnly: false, verifier: nil)
+        saveJournal()
+        return name
+    }
+
+    private func stageEmpty(_ id: UInt64) throws {
+        guard let node = nodes[id], let remote = node.remote else { throw NFSStatus.stale }
+        pending[id] = Pending(name: node.name, parentDriveID: try driveID(ofFolder: node.parent),
+                              staging: try staging.create(), driveID: remote.id, modified: Date(),
+                              session: nil, localOnly: false, verifier: nil)
+        saveJournal()
+    }
+
+    private func changed(_ id: UInt64) async {
+        guard let p = pending[id], !p.localOnly else { return }
+        await uploads.touch(id)
+    }
+
+    /// Removes an entry's content: staged data is deleted, Drive items go to the trash.
+    private func discard(_ id: UInt64) async throws {
+        if let p = pending[id] {
+            await uploads.cancel(id)
+            staging.delete(p.staging)
+            pending[id] = nil
+            saveJournal()
+        }
+        if let remote = nodes[id]?.remote {
+            try await call { try await self.drive.trash(remote.id) }
+            await reader.forget(remote.id)
+        }
+    }
+
+    /// Uploads a staged file. Called by `UploadQueue` once writes have stopped.
+    private func upload(_ id: UInt64) async throws {
+        guard let p = pending[id], !p.localOnly else { return }
+        try staging.sync(p.staging)
+        staging.close(p.staging)
+        let target: DriveClient.UploadTarget = p.driveID.map { .replace(fileID: $0) }
+            ?? .new(name: Self.driveName(p.name), parentID: p.parentDriveID)
+        log.info("uploading \(p.name, privacy: .public)")
+        let file = try await drive.upload(staging.url(p.staging), to: target, modified: p.modified, session: p.session,
+                                          onSession: { [weak self] url in Task { await self?.setSession(id, url) } },
+                                          progress: { _, _ in })
+        try Task.checkCancellation()
+        guard let current = pending[id], current.staging == p.staging else {
+            // Deleted while the last bytes were in flight: don't leave the upload behind.
+            if pending[id] == nil && nodes[id] == nil && p.driveID == nil { try? await drive.trash(file.id) }
+            return
+        }
+        pending[id] = nil
+        staging.delete(p.staging)
+        saveJournal()
+        idByDriveID[file.id] = id
+        nodes[id]?.remote = file
+        log.info("uploaded \(p.name, privacy: .public)")
+    }
+
+    private func setSession(_ id: UInt64, _ url: URL) {
+        pending[id]?.session = url
+        saveJournal()
+    }
+
+    private func saveJournal() {
+        do {
+            try JSONEncoder().encode(pending).write(to: journalURL, options: .atomic)
+        } catch {
+            log.error("could not save upload journal: \(String(describing: error), privacy: .public)")
+        }
+    }
+
     // MARK: Listings
 
     private func folder(_ id: UInt64) async throws -> Folder {
         guard let node = nodes[id] else { throw NFSStatus.stale }
-        guard node.file.isFolder else { throw NFSStatus.notdir }
+        guard let remote = node.remote, remote.isFolder else { throw NFSStatus.notdir }
         if let f = folders[id], f.fetched.timeIntervalSinceNow > -listingTTL { return f }
 
         // One listing per folder at a time; concurrent lookups wait for it.
         if let running = listing[id] {
             try await running.value
         } else {
-            let task = Task { try await self.refresh(id, driveID: node.file.id) }
+            let task = Task { try await self.refresh(id, driveID: remote.id) }
             listing[id] = task
             defer { listing[id] = nil }
             do {
@@ -119,22 +407,50 @@ public actor DriveFileSystem: FileSystemBackend {
         let files = try await drive.children(of: driveID)
         var children: [String: UInt64] = [:]
         var ordered: [UInt64] = []
-        var hasher = Hasher64()
+        // Files written here but not uploaded yet come first, so they keep the names they were given.
+        for (pid, p) in pending.sorted(by: { $0.key < $1.key }) where p.driveID == nil && p.parentDriveID == driveID {
+            if nodes[pid] == nil { nodes[pid] = Node(name: p.name, parent: id, remote: nil) }
+            nodes[pid]?.name = p.name
+            children[p.name] = pid
+            ordered.append(pid)
+        }
         // Listing is ordered by creation, so the older of two same-named files keeps the plain name.
         for file in files where file.isFolder || file.isStreamable {
-            let name = Self.uniqueName(Self.displayName(file.name), taken: children)
             let childID = nodeID(for: file.id)
-            nodes[childID] = Node(file: file, parent: id, name: name)
+            let name = pending[childID]?.name ?? Self.uniqueName(Self.displayName(file.name), taken: children)
+            nodes[childID] = Node(name: name, parent: id, remote: file)
             children[name] = childID
             ordered.append(childID)
-            hasher.combine(file.id)
-            hasher.combine(name)
-            hasher.combine(Self.version(of: file))
         }
-        folders[id] = Folder(children: children, ordered: ordered, fetched: Date(), version: hasher.value)
+        var hasher = Hasher64()
+        for child in ordered {
+            hasher.combine(nodes[child]?.name ?? "")
+            hasher.combine(nodes[child]?.remote.map(Self.version(of:)) ?? "pending-\(child)")
+        }
+        folders[id] = Folder(children: children, ordered: ordered, fetched: Date(), version: hasher.value | 1)
+    }
+
+    private func insert(_ id: UInt64, named name: String, in directory: UInt64) {
+        guard var f = folders[directory] else { return }
+        f.children[name] = id
+        if !f.ordered.contains(id) { f.ordered.append(id) }
+        f.version = (f.version &+ 2) | 1
+        folders[directory] = f
+    }
+
+    private func removeChild(named name: String, from directory: UInt64) {
+        guard var f = folders[directory], let id = f.children.removeValue(forKey: name) else { return }
+        f.ordered.removeAll { $0 == id }
+        f.version = (f.version &+ 2) | 1
+        folders[directory] = f
     }
 
     // MARK: Helpers
+
+    private func driveID(ofFolder id: UInt64) throws -> String {
+        guard let remote = nodes[id]?.remote, remote.isFolder else { throw NFSStatus.notdir }
+        return remote.id
+    }
 
     /// Stable id derived from the Drive id, so handles survive a restart; probes on collision.
     private func nodeID(for driveID: String) -> UInt64 {
@@ -142,25 +458,50 @@ public actor DriveFileSystem: FileSystemBackend {
         var h = Hasher64()
         h.combine(driveID)
         var id = h.value & 0x7FFF_FFFF_FFFF_FFFF
-        while id <= rootID || nodes[id] != nil { id &+= 1 }
+        while id <= rootID || nodes[id] != nil || pending[id] != nil { id &+= 1 }
         idByDriveID[driveID] = id
         return id
     }
 
-    private func attributes(_ id: UInt64, _ file: DriveFile) -> FileAttributes {
-        FileAttributes(id: id, kind: file.isFolder ? .directory : .file,
-                       size: file.isFolder ? 0 : file.size, bytesOnDisk: 0,
-                       modified: file.modifiedTime, changed: file.modifiedTime)
+    /// Id for a file that exists only locally so far. Kept in the journal, so it survives restarts.
+    private func newNodeID() -> UInt64 {
+        var id: UInt64
+        repeat { id = UInt64.random(in: 2...0x7FFF_FFFF_FFFF_FFFF) } while nodes[id] != nil || pending[id] != nil
+        return id
+    }
+
+    /// Runs a Drive call, mapping failures to NFS status codes.
+    private func call<T: Sendable>(_ body: @Sendable () async throws -> T) async throws -> T {
+        do {
+            return try await body()
+        } catch {
+            log.error("drive call failed: \(String(describing: error), privacy: .public)")
+            throw Self.status(for: error)
+        }
     }
 
     static func version(of file: DriveFile) -> String {
         file.md5Checksum ?? "\(file.modifiedTime.timeIntervalSince1970)-\(file.size)"
     }
 
+    /// Finder's metadata files: kept on this Mac, never uploaded.
+    static func isLocalOnly(_ name: String) -> Bool {
+        name.hasPrefix("._") || [".DS_Store", ".localized", "Icon\r", ".VolumeIcon.icns"].contains(name)
+    }
+
+    static let refusedDirectories: Set<String> = [
+        ".Trashes", ".fseventsd", ".Spotlight-V100", ".TemporaryItems", ".DocumentRevisions-V100",
+    ]
+
     /// Drive allows "/" in names; Finder shows ":" in a POSIX name as "/".
     static func displayName(_ name: String) -> String {
         let n = name.replacingOccurrences(of: "/", with: ":")
         return n.isEmpty || n == "." || n == ".." ? "_\(n)" : n
+    }
+
+    /// The inverse of `displayName` for names created on the Mac.
+    static func driveName(_ name: String) -> String {
+        name.replacingOccurrences(of: ":", with: "/")
     }
 
     /// "clip.mov" -> "clip (2).mov" when the name is already used in this folder.
