@@ -31,6 +31,7 @@ public actor ChunkedReader {
     public let chunkSize: UInt64
     public let capacity: Int
     public let maxReadahead: Int
+    public let maxRun: Int
 
     private struct Key: Hashable {
         let file: String
@@ -43,9 +44,13 @@ public actor ChunkedReader {
         var window: Int
     }
 
+    /// One chunk's share of a download. Readahead downloads cover a run of chunks with a
+    /// single request; every chunk in the run points at the same `run` task.
     private struct Download {
         let id: Int
         let task: Task<Data, Error>
+        let run: Task<Data, Error>
+        let indices: ClosedRange<UInt64>
         var urgent: Bool
     }
 
@@ -71,14 +76,18 @@ public actor ChunkedReader {
     ///   - chunkSize: Download and cache unit.
     ///   - capacity: Cache budget in bytes; least recently used chunks are dropped past it.
     ///   - maxReadahead: Most chunks fetched ahead of a sequential reader.
+    ///   - maxRun: Most consecutive chunks merged into one readahead request. Each request pays
+    ///     the server's time to first byte (about 0.6 s for Drive), so 1 MB requests alone cannot
+    ///     keep up with high-bitrate video.
     ///   - concurrency: Downloads in flight at once.
-    public init(chunkSize: UInt64 = 1 << 20, capacity: Int = 256 << 20, maxReadahead: Int = 32,
-                concurrency: Int = 6, fetch: @escaping Fetch) {
-        precondition(chunkSize > 0 && capacity >= Int(chunkSize))
+    public init(chunkSize: UInt64 = 1 << 20, capacity: Int = 256 << 20, maxReadahead: Int = 128,
+                maxRun: Int = 8, concurrency: Int = 6, fetch: @escaping Fetch) {
+        precondition(chunkSize > 0 && capacity >= Int(chunkSize) && maxRun > 0)
         self.chunkSize = chunkSize
         self.capacity = capacity
         self.maxReadahead = maxReadahead
-        self.gate = DownloadGate(limit: concurrency, reserved: concurrency > 1 ? 1 : 0)
+        self.maxRun = maxRun
+        self.gate = DownloadGate(limit: concurrency, readaheadLimit: max(1, min(2, concurrency - 1)))
         self.fetch = fetch
     }
 
@@ -135,26 +144,50 @@ public actor ChunkedReader {
             await readahead(file, after: last, window: window, lastChunk: lastChunk)
             return
         }
-        let sequential = first >= s.lastIndex && first <= s.lastIndex + 1
+        // The client's own readahead reaches the server slightly out of order, so reads near
+        // the furthest point so far still count as sequential.
+        let slack: UInt64 = 8
+        let sequential = first + slack >= s.lastIndex && first <= s.lastIndex + slack
         let window = sequential ? min(maxReadahead, max(1, s.window) * 2) : min(maxReadahead, 4)
-        streams[file.id] = Stream(lastIndex: last, window: window)
+        streams[file.id] = Stream(lastIndex: sequential ? max(s.lastIndex, last) : last, window: window)
         if !sequential {
             // Seek: queued readahead elsewhere in the file would only delay the new position.
             // Queued ones are dropped; running ones are cancelled so they stop using bandwidth.
             let keep = first...(last + UInt64(window))
             await gate.drop(group: file.id) { keep.contains($0) }
-            for (key, d) in inflight where key.file == file.id && !d.urgent && !keep.contains(key.index) {
-                d.task.cancel()
+            for (key, d) in inflight where key.file == file.id && !d.urgent
+                && !d.indices.contains(where: keep.contains) {
+                d.run.cancel()
             }
         }
-        await readahead(file, after: last, window: window, lastChunk: lastChunk)
+        await readahead(file, after: streams[file.id]!.lastIndex, window: window, lastChunk: lastChunk)
     }
 
+    /// Requests the missing chunks in the window, merging consecutive ones into runs.
     private func readahead(_ file: RemoteFile, after last: UInt64, window: Int, lastChunk: UInt64) async {
         guard window > 0, last < lastChunk else { return }
-        for i in (last + 1)...min(lastChunk, last + UInt64(window)) {
-            _ = await task(for: file, index: i, urgent: false)
+        let missing = ((last + 1)...min(lastChunk, last + UInt64(window))).filter {
+            let key = Key(file: file.id, version: file.version, index: $0)
+            return chunks[key] == nil && inflight[key] == nil
         }
+        // Requests grow with the window: small right after a seek so the first bytes arrive
+        // soon, up to `maxRun` once playback is steady and throughput matters more.
+        for run in Self.runs(of: missing, maxLength: max(1, min(maxRun, window / 4))) {
+            await startRun(file, run, urgent: false)
+        }
+    }
+
+    /// Splits ascending indices into consecutive runs of at most `maxLength`.
+    static func runs(of indices: [UInt64], maxLength: Int) -> [ClosedRange<UInt64>] {
+        var out: [ClosedRange<UInt64>] = []
+        for i in indices {
+            if let r = out.last, i == r.upperBound + 1, r.count < maxLength {
+                out[out.count - 1] = r.lowerBound...i
+            } else {
+                out.append(i...i)
+            }
+        }
+        return out
     }
 
     // MARK: Cache
@@ -187,21 +220,33 @@ public actor ChunkedReader {
         let priority = DownloadGate.Priority(urgent: urgent, index: rank ?? index)
         if let running = inflight[key] {
             if urgent && !running.urgent {
-                inflight[key]?.urgent = true
+                // The whole run becomes urgent: it is one request.
+                for i in running.indices {
+                    inflight[Key(file: file.id, version: file.version, index: i)]?.urgent = true
+                }
                 await gate.promote(id: running.id, to: priority)
             }
             return running.task
         }
 
+        await startRun(file, index...index, urgent: urgent, rank: rank)
+        return inflight[key]!.task
+    }
+
+    /// Starts one request covering `indices` and registers each chunk as in flight.
+    private func startRun(_ file: RemoteFile, _ indices: ClosedRange<UInt64>, urgent: Bool, rank: UInt64? = nil) async {
         nextDownloadID += 1
         let id = nextDownloadID
-        let start = index * chunkSize
-        let range = start..<min(file.size, start + chunkSize)
+        let priority = DownloadGate.Priority(urgent: urgent, index: rank ?? indices.lowerBound)
+        let start = indices.lowerBound * chunkSize
+        let range = start..<min(file.size, (indices.upperBound + 1) * chunkSize)
+        let keys = indices.map { Key(file: file.id, version: file.version, index: $0) }
+        let chunkSize = self.chunkSize
         let fetch = self.fetch
         let gate = self.gate
-        let t = Task { [weak self] () throws -> Data in
+        let run = Task { [weak self] () throws -> Data in
             guard await gate.acquire(id: id, group: file.id, priority: priority) else {
-                await self?.finish(key, id: id, data: nil)
+                for key in keys { await self?.finish(key, id: id, data: nil) }
                 throw Dropped()
             }
             let result: Result<Data, Error>
@@ -212,11 +257,24 @@ public actor ChunkedReader {
                 result = .failure(error)
             }
             await gate.release(id: id)
-            await self?.finish(key, id: id, data: try? result.get())
+            let data = try? result.get()
+            for (n, key) in keys.enumerated() {
+                let piece = data.map { d -> Data in
+                    let lo = d.startIndex + n * Int(chunkSize)
+                    return d.subdata(in: lo..<min(d.endIndex, lo + Int(chunkSize)))
+                }
+                await self?.finish(key, id: id, data: piece)
+            }
             return try result.get()
         }
-        inflight[key] = Download(id: id, task: t, urgent: urgent)
-        return t
+        for (n, key) in keys.enumerated() {
+            let piece = Task { () throws -> Data in
+                let d = try await run.value
+                let lo = d.startIndex + n * Int(chunkSize)
+                return d.subdata(in: lo..<min(d.endIndex, lo + Int(chunkSize)))
+            }
+            inflight[key] = Download(id: id, task: piece, run: run, indices: indices, urgent: urgent)
+        }
     }
 
     private func finish(_ key: Key, id: Int, data: Data?) {

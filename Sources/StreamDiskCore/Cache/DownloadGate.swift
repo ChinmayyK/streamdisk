@@ -23,18 +23,20 @@ actor DownloadGate {
     }
 
     let limit: Int
-    /// Slots only urgent requests may use, so a blocked read never waits behind readahead.
-    let reserved: Int
+    /// Most readahead requests running at once. Fewer, larger readahead requests keep each one
+    /// fast, so a read that lands inside one does not wait long; the rest of `limit` is left
+    /// for reads a client is blocked on.
+    let readaheadLimit: Int
     private var running = 0
     private var urgentRunning = 0
     /// Urgency each running request started with, since a queued request can be promoted.
     private var started: [Int: Bool] = [:]
     private var waiting: [Int: Waiter] = [:]
 
-    init(limit: Int, reserved: Int = 1) {
-        precondition(limit > reserved && reserved >= 0)
+    init(limit: Int, readaheadLimit: Int) {
+        precondition(limit > 0 && readaheadLimit > 0 && readaheadLimit <= limit)
         self.limit = limit
-        self.reserved = reserved
+        self.readaheadLimit = readaheadLimit
     }
 
     /// Waits for a slot. Returns false if the request was dropped while queued.
@@ -58,7 +60,8 @@ actor DownloadGate {
     /// Readahead also waits while anything urgent is downloading: on a slow link, sharing it
     /// would delay the bytes a player is blocked on.
     private func canStart(_ p: Priority) -> Bool {
-        p.urgent ? running < limit : urgentRunning == 0 && running < limit - reserved
+        guard running < limit else { return false }
+        return p.urgent || (urgentRunning == 0 && running - urgentRunning < readaheadLimit)
     }
 
     private func start(_ id: Int, _ p: Priority) {

@@ -135,7 +135,10 @@ private func expected(_ offset: UInt64, _ count: Int) -> [UInt8] {
         _ = try await r.read(file, offset: 0, count: 10)
         _ = try await r.read(file, offset: 60 * chunk, count: 10)
         try await Task.sleep(for: .milliseconds(400))
-        let fetched = Set(await remote.fetched.map { $0.lowerBound / chunk })
+        // Every chunk covered by a request, including merged readahead runs.
+        let fetched = Set(await remote.fetched.flatMap { r in
+            stride(from: r.lowerBound, to: r.upperBound, by: Int(chunk)).map { $0 / chunk }
+        })
         // Chunks 1...4 were queued behind the tail; most never download after the seek.
         #expect(fetched.intersection(2...4).isEmpty)
         #expect(fetched.isSuperset(of: [0, 60, 61, 62, 63, 64]))
@@ -160,7 +163,7 @@ private func expected(_ offset: UInt64, _ count: Int) -> [UInt8] {
 
 @Suite struct DownloadGateTests {
     @Test func readaheadNeverTakesTheReservedSlot() async {
-        let gate = DownloadGate(limit: 2, reserved: 1)
+        let gate = DownloadGate(limit: 2, readaheadLimit: 1)
         let low = DownloadGate.Priority(urgent: false, index: 1)
         #expect(await gate.acquire(id: 1, group: "f", priority: low))
         // A second readahead must queue even though one slot is free.
@@ -202,7 +205,7 @@ actor ManagedCounter {
 
 @Suite struct DownloadGatePromotionTests {
     @Test func promotedRequestReleasesItsUrgentSlot() async {
-        let gate = DownloadGate(limit: 2, reserved: 1)
+        let gate = DownloadGate(limit: 2, readaheadLimit: 1)
         #expect(await gate.acquire(id: 1, group: "f", priority: .init(urgent: true, index: 0)))
         let queued = Task { await gate.acquire(id: 2, group: "f", priority: .init(urgent: false, index: 5)) }
         try? await Task.sleep(for: .milliseconds(20))
@@ -212,5 +215,47 @@ actor ManagedCounter {
         await gate.release(id: 2)
         // Nothing urgent is left running, so readahead starts at once.
         #expect(await gate.acquire(id: 3, group: "f", priority: .init(urgent: false, index: 6)))
+    }
+}
+
+@Suite struct ReadaheadRunTests {
+    @Test func splitsIntoConsecutiveCappedRuns() {
+        #expect(ChunkedReader.runs(of: [1, 2, 3, 5, 6, 9], maxLength: 2) == [1...2, 3...3, 5...6, 9...9])
+        #expect(ChunkedReader.runs(of: [], maxLength: 8).isEmpty)
+    }
+
+    @Test func readaheadIsMergedIntoFewRequests() async throws {
+        let remote = FakeRemote()
+        let r = ChunkedReader(chunkSize: 1024, capacity: 1 << 20, maxReadahead: 16, maxRun: 8) { _, range in
+            try await remote.fetch(range)
+        }
+        let file = RemoteFile(id: "f", version: "1", size: 1024 * 1024)
+        for i in 0..<4 { _ = try await r.read(file, offset: UInt64(i) * 1024, count: 1024) }
+        try await Task.sleep(for: .milliseconds(100))
+        let ranges = await remote.fetched
+        // Some readahead requests must span several chunks.
+        #expect(ranges.contains { $0.count > 1024 })
+        // Every byte fetched is served correctly from merged requests.
+        #expect(try await r.read(file, offset: 9 * 1024 + 10, count: 3000) == expected(9 * 1024 + 10, 3000))
+        // Nothing is downloaded twice.
+        var seen = Set<UInt64>()
+        for range in ranges {
+            for c in stride(from: range.lowerBound, to: range.upperBound, by: 1024) { #expect(seen.insert(c / 1024).inserted) }
+        }
+    }
+}
+
+@Suite struct ClientReorderingTests {
+    @Test func slightlyOutOfOrderReadsStaySequential() async throws {
+        let remote = FakeRemote()
+        let r = ChunkedReader(chunkSize: 1024, capacity: 1 << 20, maxReadahead: 16, maxRun: 4) { _, range in
+            try await remote.fetch(range)
+        }
+        let file = RemoteFile(id: "f", version: "1", size: 1024 * 1024)
+        // The macOS client pipelines reads, so they can arrive 0, 2, 1, 4, 3.
+        for i: UInt64 in [0, 2, 1, 4, 3] { _ = try await r.read(file, offset: i * 1024, count: 1024) }
+        try await Task.sleep(for: .milliseconds(150))
+        // Treated as one sequential stream, the window has grown well past the reset size of 4.
+        #expect(await r.isCached(file, index: 12))
     }
 }
