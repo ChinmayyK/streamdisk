@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "StreamDisk",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS(.v15)],
     products: [
         .executable(name: "streamdisk", targets: ["streamdisk"]),
     ],
@@ -13,6 +13,8 @@ let package = Package(
         // Google Drive client, auth, chunk cache, and the Drive-backed file system.
         .target(name: "StreamDiskCore", dependencies: ["NFSServer"]),
         .executableTarget(name: "streamdisk", dependencies: ["StreamDiskCore", "NFSServer"]),
+        // The menu bar app. scripts/build-app.sh wraps it in StreamDisk.app.
+        .executableTarget(name: "StreamDiskApp", dependencies: ["StreamDiskCore", "NFSServer"]),
         // Sample volume for website screenshots; not part of the app.
         .executableTarget(name: "demo-volume", dependencies: ["NFSServer"]),
         .testTarget(name: "NFSServerTests", dependencies: ["NFSServer"]),
