@@ -37,3 +37,7 @@ streamdisk mount            # mounts at ~/StreamDisk; Ctrl-C to unmount
 swift test
 STREAMDISK_MOUNT_TESTS=1 swift test   # also mounts a real volume through the system NFS client
 ```
+
+## License
+
+StreamDisk is free and open source under the [GNU General Public License v3.0](LICENSE).
