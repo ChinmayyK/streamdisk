@@ -4,3 +4,4 @@
 xcuserdata/
 .DS_Store
 oauth_client.json
+build/
