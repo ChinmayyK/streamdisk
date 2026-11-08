@@ -42,6 +42,7 @@ public actor DriveFileSystem: WritableFileSystemBackend {
     }
 
     private let drive: any DriveService
+    private let offline: OfflineStore?
     private let reader: ChunkedReader
     private let staging: StagingStore
     private let uploads: UploadQueue
@@ -62,10 +63,12 @@ public actor DriveFileSystem: WritableFileSystemBackend {
     /// - Parameters:
     ///   - stateDirectory: Holds the staging files and the journal.
     ///   - uploadDelay: How long a file must go without writes before it uploads.
+    ///   - offline: Copies of kept files; reads use them instead of streaming when current.
     public init(drive: any DriveService, root: DriveFile, stateDirectory: URL = AppPaths.support,
                 cacheBytes: Int = 256 << 20, listingTTL: TimeInterval = 15,
-                uploadDelay: Duration = .seconds(2)) throws {
+                uploadDelay: Duration = .seconds(2), offline: OfflineStore? = nil) throws {
         self.drive = drive
+        self.offline = offline
         self.listingTTL = listingTTL
         self.reader = ChunkedReader(capacity: cacheBytes) { file, range in
             try await drive.download(file.id, range: range)
@@ -101,8 +104,9 @@ public actor DriveFileSystem: WritableFileSystemBackend {
             return FileAttributes(id: id, kind: .file, size: size, bytesOnDisk: size, modified: p.modified)
         }
         guard let remote = nodes[id]?.remote else { throw NFSStatus.stale }
+        let kept = offline?.hasCopy(remote.id, version: remote.contentVersion) == true
         return FileAttributes(id: id, kind: remote.isFolder ? .directory : .file,
-                              size: remote.isFolder ? 0 : remote.size, bytesOnDisk: 0,
+                              size: remote.isFolder ? 0 : remote.size, bytesOnDisk: kept ? remote.size : 0,
                               modified: remote.modifiedTime, changed: remote.modifiedTime)
     }
 
@@ -130,6 +134,9 @@ public actor DriveFileSystem: WritableFileSystemBackend {
         if let p = pending[id] { return try staging.read(p.staging, offset: offset, count: count) }
         guard let node = nodes[id], let remote = node.remote else { throw NFSStatus.stale }
         guard !remote.isFolder else { throw NFSStatus.isdir }
+        if let local = offline?.read(remote.id, version: remote.contentVersion, offset: offset, count: count) {
+            return local
+        }
         let file = RemoteFile(id: remote.id, version: Self.version(of: remote), size: remote.size)
         do {
             let bytes = try await reader.read(file, offset: offset, count: count)
@@ -243,6 +250,7 @@ public actor DriveFileSystem: WritableFileSystemBackend {
         guard let remote = nodes[id]?.remote, remote.isFolder else { throw NFSStatus.notdir }
         guard try await self.folder(id).ordered.isEmpty else { throw NFSStatus.notEmpty }
         try await call { try await self.drive.trash(remote.id) }
+        await offline?.forget(remote.id)
         folders[id] = nil
         removeChild(named: name, from: directory)
     }
@@ -343,6 +351,7 @@ public actor DriveFileSystem: WritableFileSystemBackend {
         if let remote = nodes[id]?.remote {
             try await call { try await self.drive.trash(remote.id) }
             await reader.forget(remote.id)
+            await offline?.forget(remote.id)
         }
     }
 
@@ -363,6 +372,10 @@ public actor DriveFileSystem: WritableFileSystemBackend {
             // Deleted while the last bytes were in flight: don't leave the upload behind.
             if pending[id] == nil && nodes[id] == nil && p.driveID == nil { try? await drive.trash(file.id) }
             return
+        }
+        // Inside a kept item: the staged file becomes the offline copy.
+        if let offline {
+            _ = await offline.adopt(file, from: staging.url(p.staging), ancestors: [file.id] + driveAncestors(of: id))
         }
         pending[id] = nil
         uploadSent[id] = nil
@@ -525,6 +538,31 @@ public actor DriveFileSystem: WritableFileSystemBackend {
         folders[directory] = f
     }
 
+    // MARK: Paths
+
+    /// The Drive item at a slash-separated path below the root, as Finder shows it.
+    /// The empty path is the root.
+    public func item(atPath path: String) async throws -> DriveFile {
+        var id = rootID
+        for name in path.split(separator: "/").map(String.init) {
+            guard let child = try await folder(id).children[name] else { throw NFSStatus.noent }
+            id = child
+        }
+        guard let remote = nodes[id]?.remote else { throw NFSStatus.noent }  // not uploaded yet
+        return remote
+    }
+
+    /// Drive ids of the folders above `id`, nearest first.
+    private func driveAncestors(of id: UInt64) -> [String] {
+        var result: [String] = []
+        var current = id
+        while current != rootID, let parent = nodes[current]?.parent {
+            if let remote = nodes[parent]?.remote { result.append(remote.id) }
+            current = parent
+        }
+        return result
+    }
+
     // MARK: Helpers
 
     private func driveID(ofFolder id: UInt64) throws -> String {
@@ -561,7 +599,7 @@ public actor DriveFileSystem: WritableFileSystemBackend {
     }
 
     static func version(of file: DriveFile) -> String {
-        file.md5Checksum ?? "\(file.modifiedTime.timeIntervalSince1970)-\(file.size)"
+        file.contentVersion
     }
 
     /// Finder's metadata files: kept on this Mac, never uploaded.
