@@ -12,6 +12,26 @@ StreamDisk mounts your Google Drive as a disk on your Mac. Files show up in Find
 
 Swift 6, no third-party dependencies.
 
+## Install
+
+Download `StreamDisk-<version>.dmg` from [Releases](https://github.com/ChinmayyK/streamdisk/releases/latest), open it and drag StreamDisk to Applications. It needs a Mac with Apple silicon and macOS 15 or later.
+
+### Opening it the first time
+
+StreamDisk isn't signed by Apple yet (that needs a paid Apple Developer account), so macOS stops the first open with a message that it can't verify the app. To open it:
+
+1. Open StreamDisk. When macOS says it can't verify it, click **Done**.
+2. Open **System Settings › Privacy & Security**, scroll down to Security, and click **Open Anyway** next to StreamDisk.
+3. Confirm with your password, then click **Open Anyway** once more.
+
+You only do this once. If you prefer Terminal, this does the same:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/StreamDisk.app
+```
+
+After an update, macOS may ask once whether StreamDisk can use its saved sign-in in your Keychain. Click **Always Allow**.
+
 ## Build
 
 Requires macOS 14 or later and Xcode.

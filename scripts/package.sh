@@ -1,6 +1,8 @@
 #!/bin/zsh
-# Builds a release StreamDisk.app and wraps it in build/StreamDisk-<version>.dmg with an
-# Applications shortcut, ready to attach to a GitHub release.
+# Builds a release StreamDisk.app and wraps it in build/StreamDisk-<version>.dmg: the app on the
+# left, an Applications shortcut on the right, and a background (Design/dmg/background.svg,
+# exported as a 1x + 2x TIFF) that also says how to open an app Apple hasn't notarized.
+# Needs create-dmg (brew install create-dmg).
 # Usage: scripts/package.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -8,11 +10,21 @@ cd "$(dirname "$0")/.."
 scripts/build-app.sh release
 version=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" build/StreamDisk.app/Contents/Info.plist)
 dmg="build/StreamDisk-$version.dmg"
-
-stage=$(mktemp -d)
-trap 'rm -rf "$stage"' EXIT
-cp -R build/StreamDisk.app "$stage/"
-ln -s /Applications "$stage/Applications"
 rm -f "$dmg"
-hdiutil create -volname "StreamDisk" -srcfolder "$stage" -fs HFS+ -format UDZO -ov "$dmg" >/dev/null
+
+create-dmg \
+  --volname "StreamDisk" \
+  --volicon "build/StreamDisk.app/Contents/Resources/AppIcon.icns" \
+  --background "Design/dmg/background.tiff" \
+  --window-pos 200 120 \
+  --window-size 600 468 \
+  --icon-size 128 \
+  --text-size 13 \
+  --icon "StreamDisk.app" 150 165 \
+  --hide-extension "StreamDisk.app" \
+  --app-drop-link 450 165 \
+  "$dmg" \
+  "build/StreamDisk.app" >/dev/null
+
+shasum -a 256 "$dmg"
 echo "Packaged $dmg ($(du -h "$dmg" | cut -f1))"

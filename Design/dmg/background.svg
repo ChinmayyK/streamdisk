@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="440" viewBox="0 0 600 440">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f7f4ef"/>
+      <stop offset="1" stop-color="#efe9e0"/>
+    </linearGradient>
+  </defs>
+  <rect width="600" height="440" fill="url(#bg)"/>
+  <!-- Arrow from the app (x 150) to Applications (x 450), at icon height. -->
+  <g fill="none" stroke="#d47a1f" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M238 165 H352" stroke-dasharray="1 13"/>
+    <path d="M344 151 L362 165 L344 179"/>
+  </g>
+  <text x="300" y="292" text-anchor="middle" font-family="-apple-system, 'SF Pro Text', 'Helvetica Neue', sans-serif" font-size="15" font-weight="600" fill="#2a2520">Drag StreamDisk to Applications</text>
+  <!-- First-open help: StreamDisk isn't notarized, so macOS blocks the first open. -->
+  <rect x="40" y="318" width="520" height="94" rx="12" fill="#fffdfa" fill-opacity="0.9" stroke="#e2d9cc"/>
+  <text x="62" y="343" font-family="-apple-system, 'SF Pro Text', 'Helvetica Neue', sans-serif" font-size="12.5" font-weight="600" fill="#2a2520">Opening it the first time</text>
+  <text x="62" y="364" font-family="-apple-system, 'SF Pro Text', 'Helvetica Neue', sans-serif" font-size="12.5" fill="#6b6158">StreamDisk isn't signed by Apple yet, so macOS stops the first open. Click Done,</text>
+  <text x="62" y="382" font-family="-apple-system, 'SF Pro Text', 'Helvetica Neue', sans-serif" font-size="12.5" fill="#6b6158">then open System Settings › Privacy &amp; Security and click Open Anyway next to</text>
+  <text x="62" y="400" font-family="-apple-system, 'SF Pro Text', 'Helvetica Neue', sans-serif" font-size="12.5" fill="#6b6158">StreamDisk. You only do this once.</text>
+</svg>
