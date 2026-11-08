@@ -40,6 +40,14 @@ struct MenuBarLabel: View {
             .task {
                 await model.launch()
                 if model.needsOnboarding { openWindow(id: WelcomeWindow.id) }
+                #if DEBUG
+                // Website captures: show the windows the site uses.
+                if ProcessInfo.processInfo.environment["STREAMDISK_SHOWCASE"] != nil {
+                    model.settingsTab = .kept
+                    openWindow(id: WelcomeWindow.id)
+                    openWindow(id: SettingsWindow.id)
+                }
+                #endif
             }
     }
 }
