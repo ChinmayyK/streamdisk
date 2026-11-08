@@ -53,6 +53,9 @@ final class AppModel {
 
     /// Called once at launch: mounts straight away if already signed in.
     func launch() async {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["STREAMDISK_SHOWCASE"] != nil { return showcase() }
+        #endif
         do {
             let auth = GoogleAuth(client: try OAuthClient.locate())
             self.auth = auth
@@ -279,3 +282,32 @@ final class AppModel {
         return String(describing: error)
     }
 }
+
+#if DEBUG
+extension AppModel {
+    /// Sample state for website captures (STREAMDISK_SHOWCASE=1): the same sample files as
+    /// the demo-volume tool, no Google account and nothing mounted.
+    func showcase() {
+        let gb: UInt64 = 1_000_000_000
+        phase = .mounted
+        fullDrive = true
+        email = "chinmaykudalkar@gmail.com"
+        quota = DriveQuota(limit: 2_000 * gb, usage: 824 * gb)
+        activity = .init(streams: [.init(name: "Konkan monsoon 4K.mov", bytesPerSecond: 4_300_000)],
+                         uploads: [.init(name: "Portfolio scans.zip", sent: 2_710_000_000, total: 4_098_566_144)])
+        let now = Date()
+        kept = [
+            .init(pin: .init(driveID: "a", name: "Lecture 12, Fluid mechanics.mp4", isFolder: false,
+                             path: "Lecture 12, Fluid mechanics.mp4", added: now),
+                  files: 1, bytes: 2_417_206_272, stored: 2_417_206_272, state: .ready),
+            .init(pin: .init(driveID: "b", name: "Wedding, Pune (raw)", isFolder: true,
+                             path: "Wedding, Pune (raw)", added: now),
+                  files: 214, bytes: 31_840_000_000, stored: 12_380_000_000, state: .downloading),
+            .init(pin: .init(driveID: "c", name: "Tax documents 2025.pdf", isFolder: false,
+                             path: "Tax documents 2025.pdf", added: now),
+                  files: 1, bytes: 3_912_384, stored: 3_912_384, state: .ready),
+        ]
+        keptBytes = kept.reduce(0) { $0 + $1.stored }
+    }
+}
+#endif

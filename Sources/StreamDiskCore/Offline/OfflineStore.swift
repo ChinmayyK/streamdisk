@@ -21,6 +21,14 @@ public actor OfflineStore {
         public let added: Date
 
         public var id: String { driveID }
+
+        public init(driveID: String, name: String, isFolder: Bool, path: String, added: Date) {
+            self.driveID = driveID
+            self.name = name
+            self.isFolder = isFolder
+            self.path = path
+            self.added = added
+        }
     }
 
     public struct PinStatus: Sendable, Equatable, Identifiable {
@@ -42,6 +50,14 @@ public actor OfflineStore {
         public let state: State
 
         public var id: String { pin.driveID }
+
+        public init(pin: Pin, files: Int, bytes: UInt64, stored: UInt64, state: State) {
+            self.pin = pin
+            self.files = files
+            self.bytes = bytes
+            self.stored = stored
+            self.state = state
+        }
     }
 
     /// A downloaded or downloading copy of one Drive file.

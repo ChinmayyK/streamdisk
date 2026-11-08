@@ -56,6 +56,11 @@ public struct DriveQuota: Sendable {
     /// Nil for unlimited plans.
     public let limit: UInt64?
     public let usage: UInt64
+
+    public init(limit: UInt64?, usage: UInt64) {
+        self.limit = limit
+        self.usage = usage
+    }
 }
 
 public struct DriveAccount: Sendable {

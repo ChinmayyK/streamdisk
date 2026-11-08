@@ -14,7 +14,7 @@ final class DemoBackend: FileSystemBackend {
         let gb: UInt64 = 1_000_000_000
         let mb: UInt64 = 1_000_000
         let items: [(UInt64, String, UInt64, UInt64?, TimeInterval)] = [
-            (2, "Ladakh ride 4K.mov", 1, 61 * gb + 372_118_016, 3),
+            (2, "Konkan monsoon 4K.mov", 1, 61 * gb + 372_118_016, 3),
             (3, "Interview A-cam.mov", 1, 128 * gb + 604_221_440, 9),
             (4, "Wedding, Pune (raw)", 1, nil, 21),
             (5, "Album stems.zip", 1, 18 * gb + 903_114_752, 34),
@@ -55,9 +55,9 @@ final class DemoBackend: FileSystemBackend {
 }
 
 let mountPoint = URL(fileURLWithPath: CommandLine.arguments.dropFirst().first ?? NSTemporaryDirectory() + "demo/StreamDisk")
-let server = try LocalNFSServer(backend: DemoBackend())
+let server = try LocalNFSServer(backend: DemoBackend(), exportPath: "/StreamDisk")
 let port = try await server.start()
-try NFSMount.mount(port: port, at: mountPoint)
+try NFSMount.mount(port: port, export: server.exportPath, at: mountPoint)
 print("Demo volume at \(mountPoint.path). Ctrl-C to unmount.")
 signal(SIGINT, SIG_IGN)
 let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
