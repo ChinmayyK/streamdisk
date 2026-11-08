@@ -52,6 +52,11 @@ public struct DriveQuota: Sendable {
     public let usage: UInt64
 }
 
+public struct DriveAccount: Sendable {
+    public let email: String?
+    public let quota: DriveQuota
+}
+
 public enum DriveError: Error, CustomStringConvertible {
     case http(status: Int, message: String)
     case unexpectedResponse(String)
@@ -136,14 +141,24 @@ public struct DriveClient: Sendable {
     }
 
     public func quota() async throws -> DriveQuota {
+        try await account().quota
+    }
+
+    /// The signed-in account's email address and storage.
+    public func account() async throws -> DriveAccount {
         struct About: Decodable {
+            struct User: Decodable { let emailAddress: String? }
             struct Quota: Decodable { let limit: String?; let usage: String }
+            let user: User
             let storageQuota: Quota
         }
-        let url = api.appendingPathComponent("about").appending(queryItems: [.init(name: "fields", value: "storageQuota(limit,usage)")])
+        let url = api.appendingPathComponent("about")
+            .appending(queryItems: [.init(name: "fields", value: "user(emailAddress),storageQuota(limit,usage)")])
         let (data, _) = try await send(expecting: [200]) { URLRequest(url: url) }
         let about = try JSONDecoder().decode(About.self, from: data)
-        return DriveQuota(limit: about.storageQuota.limit.flatMap(UInt64.init), usage: UInt64(about.storageQuota.usage) ?? 0)
+        return DriveAccount(
+            email: about.user.emailAddress,
+            quota: DriveQuota(limit: about.storageQuota.limit.flatMap(UInt64.init), usage: UInt64(about.storageQuota.usage) ?? 0))
     }
 
     private func query(_ q: String, orderBy: String) async throws -> [DriveFile] {

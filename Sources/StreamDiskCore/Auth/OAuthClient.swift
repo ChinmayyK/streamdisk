@@ -42,11 +42,13 @@ public struct OAuthClient: Sendable, Equatable {
         throw LoadError.malformed(url)
     }
 
-    /// `$STREAMDISK_OAUTH_CLIENT`, then the app support folder.
-    public static func locate(environment: [String: String] = ProcessInfo.processInfo.environment) throws -> OAuthClient {
+    /// `$STREAMDISK_OAUTH_CLIENT`, then the app support folder, then the copy inside the app bundle.
+    public static func locate(environment: [String: String] = ProcessInfo.processInfo.environment,
+                              bundle: Bundle = .main) throws -> OAuthClient {
         var candidates: [URL] = []
         if let path = environment["STREAMDISK_OAUTH_CLIENT"] { candidates.append(URL(fileURLWithPath: path)) }
         candidates.append(AppPaths.support.appendingPathComponent("oauth_client.json"))
+        if let bundled = bundle.url(forResource: "oauth_client", withExtension: "json") { candidates.append(bundled) }
         for url in candidates where FileManager.default.fileExists(atPath: url.path) {
             return try load(from: url)
         }

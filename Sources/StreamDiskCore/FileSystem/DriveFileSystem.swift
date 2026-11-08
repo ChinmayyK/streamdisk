@@ -398,16 +398,32 @@ public actor DriveFileSystem: WritableFileSystemBackend {
         public struct Stream: Sendable, Equatable {
             public let name: String
             public let bytesPerSecond: UInt64
+
+            public init(name: String, bytesPerSecond: UInt64) {
+                self.name = name
+                self.bytesPerSecond = bytesPerSecond
+            }
         }
         public struct Upload: Sendable, Equatable {
             public let name: String
             public let sent: UInt64
             public let total: UInt64
+
+            public init(name: String, sent: UInt64, total: UInt64) {
+                self.name = name
+                self.sent = sent
+                self.total = total
+            }
         }
         /// Files being read, fastest first.
         public var streams: [Stream] = []
         /// Files waiting to upload or uploading, by name.
         public var uploads: [Upload] = []
+
+        public init(streams: [Stream] = [], uploads: [Upload] = []) {
+            self.streams = streams
+            self.uploads = uploads
+        }
     }
 
     /// A file counts as streaming while it has been read within this window.
