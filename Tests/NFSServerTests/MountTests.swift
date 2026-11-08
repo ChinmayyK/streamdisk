@@ -16,13 +16,13 @@ struct MountTests {
             "films/empty.bin": [],
         ]) { a, _ in a })
 
-        let server = try LocalNFSServer(backend: backend)
+        let server = try LocalNFSServer(backend: backend, exportPath: "/StreamDisk")
         let port = try await server.start()
         defer { server.stop() }
 
         let mountPoint = FileManager.default.temporaryDirectory
             .appendingPathComponent("streamdisk-test-\(UUID().uuidString)")
-        try NFSMount.mount(port: port, at: mountPoint)
+        try NFSMount.mount(port: port, export: server.exportPath, at: mountPoint)
         defer {
             try? NFSMount.unmount(mountPoint, force: true)
             try? FileManager.default.removeItem(at: mountPoint)

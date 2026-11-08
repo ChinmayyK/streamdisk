@@ -3,11 +3,15 @@ import Foundation
 /// Serves a backend over NFSv3 on 127.0.0.1 and mounts it with the system NFS client.
 public final class LocalNFSServer: Sendable {
     private let rpc: RPCServer
+    /// The path clients mount. Finder and `mount` show its last component as the server's
+    /// share name, so a named export reads better than "/".
+    public let exportPath: String
 
-    public init(backend: any FileSystemBackend, port: UInt16 = 0) throws {
+    public init(backend: any FileSystemBackend, port: UInt16 = 0, exportPath: String = "/") throws {
         let uid = getuid()
+        self.exportPath = exportPath
         rpc = try RPCServer(
-            programs: [NFSProgram(backend: backend), MountProgram(rootID: backend.rootID)],
+            programs: [NFSProgram(backend: backend), MountProgram(rootID: backend.rootID, exportPath: exportPath)],
             port: port,
             // Only this user (and root, which can read their files anyway) may use the export.
             authorize: { auth in
@@ -35,7 +39,7 @@ public enum NFSMount {
 
     /// Mounts the server on `port` at `directory` (created if missing). No root needed:
     /// macOS lets a user mount NFS on a directory they own.
-    public static func mount(port: UInt16, at directory: URL) throws {
+    public static func mount(port: UInt16, export: String = "/", at directory: URL) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let options = [
             "port=\(port)", "mountport=\(port)", "vers=3", "tcp",
@@ -49,7 +53,7 @@ public enum NFSMount {
             "readahead=2",
             "actimeo=5",
         ]
-        try run("/sbin/mount_nfs", ["-o", options.joined(separator: ","), "127.0.0.1:/", directory.path])
+        try run("/sbin/mount_nfs", ["-o", options.joined(separator: ","), "127.0.0.1:\(export)", directory.path])
     }
 
     public static func unmount(_ directory: URL, force: Bool = false) throws {

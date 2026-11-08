@@ -1,12 +1,15 @@
-/// MOUNT version 3 (RFC 1813 appendix I). Exports a single path, "/", mapped to the backend root.
+/// MOUNT version 3 (RFC 1813 appendix I). Exports a single path, mapped to the backend root.
+/// "/" is always accepted too.
 public struct MountProgram: RPCProgram {
     public let program: UInt32 = 100005
     public let versions: ClosedRange<UInt32> = 3...3
 
     let rootID: UInt64
+    let exportPath: String
 
-    public init(rootID: UInt64) {
+    public init(rootID: UInt64, exportPath: String = "/") {
         self.rootID = rootID
+        self.exportPath = exportPath
     }
 
     public func handle(_ call: RPCCall) async -> RPCReply {
@@ -17,7 +20,7 @@ public struct MountProgram: RPCProgram {
             if call.procedure == 3 { _ = try? args.string(max: 1024) }
         case 1:  // MNT
             guard let path = try? args.string(max: 1024) else { return .garbageArguments }
-            guard path == "/" || path.isEmpty else {
+            guard path == exportPath || path == "/" || path.isEmpty else {
                 w.u32(NFSStatus.noent.rawValue)
                 break
             }
@@ -30,7 +33,7 @@ public struct MountProgram: RPCProgram {
             w.bool(false)
         case 5:  // EXPORT
             w.bool(true)
-            w.string("/")
+            w.string(exportPath)
             w.bool(false)  // no group restrictions
             w.bool(false)
         default:

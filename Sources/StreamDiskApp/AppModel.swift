@@ -96,10 +96,10 @@ final class AppModel {
             if Self.isMounted(mountPoint) { try? NFSMount.unmount(mountPoint, force: true) }
             let fs = try DriveFileSystem(drive: drive, root: root)
             await fs.start()
-            let server = try LocalNFSServer(backend: fs)
+            let server = try LocalNFSServer(backend: fs, exportPath: "/StreamDisk")
             let port = try await server.start()
             do {
-                try NFSMount.mount(port: port, at: mountPoint)
+                try NFSMount.mount(port: port, export: server.exportPath, at: mountPoint)
             } catch {
                 server.stop()
                 throw error

@@ -126,9 +126,9 @@ func mount(_ args: [String]) async throws {
     let root = try await topFolder(drive)
     let fs = try DriveFileSystem(drive: drive, root: root)
     await fs.start()
-    let server = try LocalNFSServer(backend: fs)
+    let server = try LocalNFSServer(backend: fs, exportPath: "/StreamDisk")
     let port = try await server.start()
-    try NFSMount.mount(port: port, at: mountPoint)
+    try NFSMount.mount(port: port, export: server.exportPath, at: mountPoint)
     print("Mounted at \(mountPoint.path). Press Ctrl-C to unmount.")
 
     // Unmount on Ctrl-C or kill so Finder is never left holding a dead mount.
