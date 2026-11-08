@@ -11,13 +11,17 @@ public struct DriveFile: Sendable, Equatable, Decodable {
     public let modifiedTime: Date
     public let createdTime: Date
     public let md5Checksum: String?
+    /// In Drive's trash. Listings leave trashed files out; fetching one by id does not.
+    public let trashed: Bool
 
     public var isFolder: Bool { mimeType == Self.folderType }
     /// Google Docs, Sheets and other native types have no byte content to stream.
     public var isStreamable: Bool { !isFolder && !mimeType.hasPrefix("application/vnd.google-apps.") }
+    /// Changes whenever the content does.
+    public var contentVersion: String { md5Checksum ?? "\(modifiedTime.timeIntervalSince1970)-\(size)" }
 
     public init(id: String, name: String, mimeType: String, size: UInt64, modifiedTime: Date,
-                createdTime: Date, md5Checksum: String? = nil) {
+                createdTime: Date, md5Checksum: String? = nil, trashed: Bool = false) {
         self.id = id
         self.name = name
         self.mimeType = mimeType
@@ -25,10 +29,11 @@ public struct DriveFile: Sendable, Equatable, Decodable {
         self.modifiedTime = modifiedTime
         self.createdTime = createdTime
         self.md5Checksum = md5Checksum
+        self.trashed = trashed
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, mimeType, size, modifiedTime, createdTime, md5Checksum
+        case id, name, mimeType, size, modifiedTime, createdTime, md5Checksum, trashed
     }
 
     public init(from decoder: Decoder) throws {
@@ -41,9 +46,10 @@ public struct DriveFile: Sendable, Equatable, Decodable {
         modifiedTime = try c.decode(Date.self, forKey: .modifiedTime)
         createdTime = try c.decode(Date.self, forKey: .createdTime)
         md5Checksum = try c.decodeIfPresent(String.self, forKey: .md5Checksum)
+        trashed = try c.decodeIfPresent(Bool.self, forKey: .trashed) ?? false
     }
 
-    static let fields = "id,name,mimeType,size,modifiedTime,createdTime,md5Checksum"
+    static let fields = "id,name,mimeType,size,modifiedTime,createdTime,md5Checksum,trashed"
 }
 
 public struct DriveQuota: Sendable {

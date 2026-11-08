@@ -13,6 +13,9 @@ actor FakeDrive: DriveService {
     let root: DriveFile
     private(set) var items: [String: Item] = [:]
     private(set) var uploadCount = 0
+    private(set) var downloadCount = 0
+    /// Makes every call fail as if offline.
+    var offline = false
     private var next = 0
 
     init() {
@@ -47,12 +50,33 @@ actor FakeDrive: DriveService {
 
     // MARK: DriveService
 
-    func children(of folderID: String) -> [DriveFile] {
-        items.values.filter { $0.parent == folderID && !$0.trashed }
+    func children(of folderID: String) throws -> [DriveFile] {
+        if offline { throw URLError(.notConnectedToInternet) }
+        return items.values.filter { $0.parent == folderID && !$0.trashed }
             .map(\.file).sorted { $0.createdTime < $1.createdTime }
     }
 
+    func file(_ id: String) throws -> DriveFile {
+        if offline { throw URLError(.notConnectedToInternet) }
+        guard let item = items[id] else { throw DriveError.http(status: 404, message: "not found") }
+        let f = item.file
+        return DriveFile(id: f.id, name: f.name, mimeType: f.mimeType, size: f.size, modifiedTime: f.modifiedTime,
+                         createdTime: f.createdTime, md5Checksum: f.md5Checksum, trashed: item.trashed)
+    }
+
+    func setOffline(_ value: Bool) { offline = value }
+
+    func replaceContent(of id: String, with data: Data) {
+        next += 1
+        let f = items[id]!.file
+        items[id]!.data = data
+        items[id]!.file = DriveFile(id: f.id, name: f.name, mimeType: f.mimeType, size: UInt64(data.count),
+                                    modifiedTime: Date(), createdTime: f.createdTime, md5Checksum: "v\(next)")
+    }
+
     func download(_ fileID: String, range: Range<UInt64>) throws -> Data {
+        if offline { throw URLError(.notConnectedToInternet) }
+        downloadCount += 1
         guard let item = items[fileID] else { throw DriveError.http(status: 404, message: "not found") }
         return item.data.subdata(in: Int(range.lowerBound)..<Int(range.upperBound))
     }

@@ -4,6 +4,7 @@ import Foundation
 /// in-memory implementation.
 public protocol DriveService: Sendable {
     func children(of folderID: String) async throws -> [DriveFile]
+    func file(_ id: String) async throws -> DriveFile
     func download(_ fileID: String, range: Range<UInt64>) async throws -> Data
     func createFolder(named name: String, in parentID: String) async throws -> DriveFile
     func upload(_ fileURL: URL, to target: DriveClient.UploadTarget, modified: Date?, session: URL?,
