@@ -75,7 +75,7 @@ struct PopoverView: View {
         case .mounted:
             VStack(spacing: 14) {
                 driveCard
-                ActivityList(activity: model.activity)
+                ActivityList(activity: model.activity, kept: model.kept)
             }
         case .ejected:
             message(title: "StreamDisk is ejected", body: "Your files stay in Google Drive.",
@@ -102,10 +102,34 @@ struct PopoverView: View {
                     Text(usageText(quota)).font(.system(size: 11.5).monospacedDigit()).foregroundStyle(.secondary)
                 }
             }
+            if !model.kept.isEmpty {
+                Button { openSettings(.kept) } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.down.circle").foregroundStyle(Theme.accentInk)
+                        Text(keptText).foregroundStyle(.secondary)
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(.tertiary)
+                    }
+                    .font(.system(size: 11.5).monospacedDigit())
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
             Button("Open in Finder") { model.openInFinder() }
                 .buttonStyle(PrimaryButtonStyle())
         }
         .card()
+    }
+
+    private var keptText: String {
+        let n = model.kept.count
+        return "\(n) \(n == 1 ? "item" : "items") kept on this Mac · \(Format.bytes(model.keptBytes))"
+    }
+
+    private func openSettings(_ tab: SettingsTab) {
+        model.settingsTab = tab
+        openWindow(id: SettingsWindow.id)
+        NSApp.activate()
     }
 
     private func usageText(_ quota: DriveQuota) -> String {
@@ -138,16 +162,7 @@ struct PopoverView: View {
             }
             Spacer()
             if model.phase != .signedOut {
-                Menu {
-                    Button("Sign Out") { Task { await model.signOut() } }
-                } label: {
-                    Text("Account")
-                }
-                .menuStyle(.button)
-                .buttonStyle(.plain)
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-                .fixedSize()
+                footerButton("Settings…") { openSettings(.general) }
                 Spacer()
             }
             footerButton("Quit") { NSApp.terminate(nil) }
@@ -166,11 +181,17 @@ struct PopoverView: View {
 /// What is streaming and uploading right now.
 struct ActivityList: View {
     let activity: DriveFileSystem.Activity
+    let kept: [OfflineStore.PinStatus]
+
+    /// Kept items still downloading, with something left to fetch.
+    private var downloading: [OfflineStore.PinStatus] {
+        kept.filter { if case .downloading = $0.state { return $0.bytes > $0.stored } else { return false } }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Activity").font(.system(size: 13, weight: .bold)).padding(.horizontal, 4).padding(.bottom, 2)
-            if activity.streams.isEmpty && activity.uploads.isEmpty {
+            if activity.streams.isEmpty && activity.uploads.isEmpty && downloading.isEmpty {
                 Text("Nothing streaming or uploading")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
                     .padding(.horizontal, 4).padding(.vertical, 6)
@@ -180,8 +201,18 @@ struct ActivityList: View {
                             detail: "Streaming · \(Format.rate(stream.bytesPerSecond))")
             }
             if !activity.uploads.isEmpty { uploadRow }
+            if !downloading.isEmpty { keepRow }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder private var keepRow: some View {
+        let total = downloading.reduce(0) { $0 + $1.bytes }
+        let stored = downloading.reduce(0) { $0 + $1.stored }
+        ActivityRow(symbol: "arrow.down",
+                    title: downloading.count == 1 ? downloading[0].pin.name : "Keeping \(downloading.count) items",
+                    detail: "Downloading to this Mac · \(Format.bytes(total - stored)) left",
+                    progress: total == 0 ? nil : Double(stored) / Double(total))
     }
 
     @ViewBuilder private var uploadRow: some View {

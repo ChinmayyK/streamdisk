@@ -224,7 +224,7 @@ struct WelcomeView: View {
     }
 
     private func finish(open: Bool) {
-        if openAtLogin != model.openAtLogin { model.openAtLogin = openAtLogin }
+        if openAtLogin != model.opensAtLogin { model.setOpensAtLogin(openAtLogin) }
         if open { model.openInFinder() }
         dismissWindow(id: WelcomeWindow.id)
     }

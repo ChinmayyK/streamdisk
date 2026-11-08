@@ -45,6 +45,23 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>15.0</string>
   <key>LSUIElement</key><true/>
   <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
+  <key>NSServices</key>
+  <array>
+    <dict>
+      <key>NSMenuItem</key><dict><key>default</key><string>Keep on This Mac</string></dict>
+      <key>NSMessage</key><string>keepOnMac</string>
+      <key>NSPortName</key><string>StreamDisk</string>
+      <key>NSRequiredContext</key><dict/>
+      <key>NSSendFileTypes</key><array><string>public.item</string></array>
+    </dict>
+    <dict>
+      <key>NSMenuItem</key><dict><key>default</key><string>Remove from This Mac</string></dict>
+      <key>NSMessage</key><string>removeFromMac</string>
+      <key>NSPortName</key><string>StreamDisk</string>
+      <key>NSRequiredContext</key><dict/>
+      <key>NSSendFileTypes</key><array><string>public.item</string></array>
+    </dict>
+  </array>
   <key>NSHumanReadableCopyright</key><string>© $(date +%Y) Chinmay Kudalkar</string>
 </dict>
 </plist>

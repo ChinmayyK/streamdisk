@@ -19,6 +19,13 @@ struct StreamDiskApp: App {
         .windowResizability(.contentSize)
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
+
+        Window("StreamDisk Settings", id: SettingsWindow.id) {
+            SettingsView().environment(delegate.model)
+        }
+        .windowResizability(.contentSize)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
     }
 }
 
@@ -40,6 +47,12 @@ struct MenuBarLabel: View {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = AppModel()
+    private lazy var services = FinderServices(model: model)
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.servicesProvider = services
+        NSUpdateDynamicServices()
+    }
 
     func applicationWillTerminate(_ notification: Notification) {
         model.shutdown()

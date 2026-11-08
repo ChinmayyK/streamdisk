@@ -22,6 +22,10 @@ final class AppModel {
     private(set) var quota: DriveQuota?
     private(set) var fullDrive = false
     private(set) var activity = DriveFileSystem.Activity()
+    /// Items kept on this Mac, with their download state.
+    private(set) var kept: [OfflineStore.PinStatus] = []
+    private(set) var keptBytes: UInt64 = 0
+    var settingsTab: SettingsTab = .general
     /// A short message about the last action that failed, such as an eject refused while a file is open.
     var notice: String?
 
@@ -30,20 +34,21 @@ final class AppModel {
     private var auth: GoogleAuth?
     private var drive: DriveClient?
     private var fs: DriveFileSystem?
+    private var offline: OfflineStore?
     private var server: LocalNFSServer?
     private var watcher: Task<Void, Never>?
 
     var needsOnboarding: Bool { phase == .signedOut }
 
-    var openAtLogin: Bool {
-        get { SMAppService.mainApp.status == .enabled }
-        set {
-            do {
-                if newValue { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
-            } catch {
-                notice = "Could not change the login item: \(error.localizedDescription)"
-            }
+    private(set) var opensAtLogin = SMAppService.mainApp.status == .enabled
+
+    func setOpensAtLogin(_ on: Bool) {
+        do {
+            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+        } catch {
+            notice = "Could not change the login item: \(error.localizedDescription)"
         }
+        opensAtLogin = SMAppService.mainApp.status == .enabled
     }
 
     /// Called once at launch: mounts straight away if already signed in.
@@ -76,8 +81,12 @@ final class AppModel {
     func signOut() async {
         await unmount(force: true)
         try? await auth?.signOut()
+        // Kept copies belong to the account that was signed in.
+        try? FileManager.default.removeItem(at: Self.offlineDirectory)
         email = nil
         quota = nil
+        kept = []
+        keptBytes = 0
         phase = .signedOut
     }
 
@@ -94,8 +103,15 @@ final class AppModel {
             let root = fullDrive ? try await drive.myDrive() : try await drive.appFolder()
             // A mount left behind by a crash would make mount_nfs fail.
             if Self.isMounted(mountPoint) { try? NFSMount.unmount(mountPoint, force: true) }
-            let fs = try DriveFileSystem(drive: drive, root: root)
+            // Mounting over a folder hides what is in it, so refuse rather than surprise.
+            if Self.hasContents(mountPoint) {
+                phase = .failed("There's already a folder named StreamDisk in your home folder with files in it. Move or rename it, then try again.")
+                return
+            }
+            let offline = try OfflineStore(drive: drive, directory: Self.offlineDirectory)
+            let fs = try DriveFileSystem(drive: drive, root: root, offline: offline)
             await fs.start()
+            await offline.start()
             let server = try LocalNFSServer(backend: fs, exportPath: "/StreamDisk")
             let port = try await server.start()
             do {
@@ -104,7 +120,7 @@ final class AppModel {
                 server.stop()
                 throw error
             }
-            (self.drive, self.fs, self.server) = (drive, fs, server)
+            (self.drive, self.fs, self.offline, self.server) = (drive, fs, offline, server)
             phase = .mounted
             startWatching()
         } catch AuthError.signedOut {
@@ -133,7 +149,8 @@ final class AppModel {
             if (try? NFSMount.unmount(mountPoint)) == nil { try? NFSMount.unmount(mountPoint, force: true) }
         }
         server?.stop()
-        (server, fs) = (nil, nil)
+        await offline?.stop()
+        (server, fs, offline) = (nil, nil, nil)
         activity = .init()
     }
 
@@ -147,6 +164,68 @@ final class AppModel {
 
     func openInFinder() {
         NSWorkspace.shared.open(mountPoint)
+    }
+
+    // MARK: Keep on this Mac
+
+    enum KeepError: LocalizedError {
+        case notMounted, notOnDisk, stillUploading(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .notMounted: "StreamDisk isn't mounted. Mount it, then try again."
+            case .notOnDisk: "Only items on the StreamDisk disk can be kept on this Mac."
+            case .stillUploading(let name): "“\(name)” is still uploading. Try again when it's done."
+            }
+        }
+    }
+
+    /// Keeps the items at these Finder locations on this Mac.
+    func keep(_ urls: [URL]) async throws {
+        guard let fs, let offline else { throw KeepError.notMounted }
+        for url in urls {
+            let path = try relativePath(url)
+            let file: DriveFile
+            do { file = try await fs.item(atPath: path) } catch { throw KeepError.stillUploading(url.lastPathComponent) }
+            await offline.keep(file, path: path)
+        }
+        await refreshKept()
+    }
+
+    /// Stops keeping the items at these Finder locations.
+    func removeKept(_ urls: [URL]) async throws {
+        guard let fs, let offline else { throw KeepError.notMounted }
+        for url in urls {
+            let path = try relativePath(url)
+            if let file = try? await fs.item(atPath: path) { await offline.remove(file.id) }
+        }
+        await refreshKept()
+    }
+
+    func removeKept(id: String) async {
+        await offline?.remove(id)
+        await refreshKept()
+    }
+
+    /// Where a kept item is in Finder now. Nil if it moved since it was kept.
+    func location(of pin: OfflineStore.Pin) -> URL? {
+        let url = mountPoint.appendingPathComponent(pin.path)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    private func relativePath(_ url: URL) throws -> String {
+        let root = mountPoint.standardizedFileURL.path
+        let path = url.standardizedFileURL.path
+        guard path == root || path.hasPrefix(root + "/") else { throw KeepError.notOnDisk }
+        return String(path.dropFirst(root.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    private func refreshKept() async {
+        guard let offline else { return }
+        let status = await offline.status()
+        if status != kept { kept = status }
+        let bytes = await offline.bytesOnDisk
+        if bytes != keptBytes { keptBytes = bytes }
     }
 
     // MARK: Status
@@ -166,6 +245,7 @@ final class AppModel {
                 }
                 let now = await fs.activity()
                 if now != self.activity { self.activity = now }
+                await self.refreshKept()
                 if tick % 60 == 0, let account = try? await self.drive?.account() {
                     self.email = account.email
                     self.quota = account.quota
@@ -174,6 +254,14 @@ final class AppModel {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
+    }
+
+    static let offlineDirectory = AppPaths.support.appendingPathComponent("Offline", isDirectory: true)
+
+    /// Whether a folder (not a mount) holds anything besides Finder's own files.
+    static func hasContents(_ url: URL) -> Bool {
+        guard !isMounted(url), let items = try? FileManager.default.contentsOfDirectory(atPath: url.path) else { return false }
+        return items.contains { ![".DS_Store", ".localized"].contains($0) }
     }
 
     static func isMounted(_ url: URL) -> Bool {
