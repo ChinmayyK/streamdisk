@@ -34,23 +34,19 @@ extension NSColor {
     }
 }
 
-/// The StreamDisk mark: a disk seen from above, with the part already streamed drawn as an arc.
+/// The StreamDisk mark: the app icon, a disk seen from above with the part already streamed
+/// drawn as an amber arc. The icon file keeps a margin for its shadow, so it is drawn larger
+/// than `size` to make the tile itself `size` points wide.
 struct Mark: View {
     var size: CGFloat = 32
 
     var body: some View {
-        let line = size * 0.075
-        ZStack {
-            RoundedRectangle(cornerRadius: size * 0.28, style: .continuous).fill(Theme.accent)
-            Circle().stroke(.white.opacity(0.35), lineWidth: line).frame(width: size * 0.6)
-            Circle().trim(from: 0, to: 0.62)
-                .stroke(.white, style: StrokeStyle(lineWidth: line, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-                .frame(width: size * 0.6)
-            Circle().fill(.white).frame(width: size * 0.14)
-        }
-        .frame(width: size, height: size)
-        .accessibilityHidden(true)
+        Image(nsImage: NSApp.applicationIconImage)
+            .resizable()
+            .interpolation(.high)
+            .frame(width: size * 1024 / 824, height: size * 1024 / 824)
+            .frame(width: size, height: size)
+            .accessibilityHidden(true)
     }
 }
 
@@ -59,15 +55,15 @@ enum MenuBarGlyph {
     static func image(mounted: Bool) -> NSImage {
         let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { rect in
             let ring = NSBezierPath(ovalIn: rect.insetBy(dx: 2.5, dy: 2.5))
-            ring.lineWidth = 1.6
-            NSColor.black.withAlphaComponent(mounted ? 0.35 : 1).setStroke()
+            ring.lineWidth = 1.4
+            NSColor.black.withAlphaComponent(mounted ? 0.4 : 1).setStroke()
             ring.stroke()
             if mounted {
-                // The streamed part, clockwise from the top.
+                // The streamed part, clockwise from the top, as on the app icon.
                 let arc = NSBezierPath()
                 arc.appendArc(withCenter: NSPoint(x: rect.midX, y: rect.midY), radius: rect.width / 2 - 2.5,
-                              startAngle: 90, endAngle: 90 - 0.62 * 360, clockwise: true)
-                arc.lineWidth = 1.8
+                              startAngle: 90, endAngle: 90 - 0.36 * 360, clockwise: true)
+                arc.lineWidth = 2.4
                 arc.lineCapStyle = .round
                 NSColor.black.setStroke()
                 arc.stroke()
