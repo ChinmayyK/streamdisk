@@ -14,7 +14,7 @@ Swift 6, no third-party dependencies.
 
 ## Install
 
-Download `StreamDisk-<version>.dmg` from [Releases](https://github.com/ChinmayyK/streamdisk/releases/latest), open it and drag StreamDisk to Applications. It needs a Mac with Apple silicon and macOS 15 or later.
+Download `StreamDisk.dmg` from [Releases](https://github.com/ChinmayyK/streamdisk/releases/latest), open it and drag StreamDisk to Applications. It needs a Mac with Apple silicon and macOS 15 or later.
 
 ### Opening it the first time
 

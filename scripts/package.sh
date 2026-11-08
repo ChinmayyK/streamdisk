@@ -1,5 +1,6 @@
 #!/bin/zsh
-# Builds a release StreamDisk.app and wraps it in build/StreamDisk-<version>.dmg: the app on the
+# Builds a release StreamDisk.app and wraps it in build/StreamDisk.dmg (a stable name, so
+# releases/latest/download/StreamDisk.dmg always works): the app on the
 # left, an Applications shortcut on the right, and a background (Design/dmg/background.svg,
 # exported as a 1x + 2x TIFF) that also says how to open an app Apple hasn't notarized.
 # Needs create-dmg (brew install create-dmg).
@@ -9,7 +10,7 @@ cd "$(dirname "$0")/.."
 
 scripts/build-app.sh release
 version=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" build/StreamDisk.app/Contents/Info.plist)
-dmg="build/StreamDisk-$version.dmg"
+dmg="build/StreamDisk.dmg"
 rm -f "$dmg"
 
 create-dmg \
@@ -27,4 +28,4 @@ create-dmg \
   "build/StreamDisk.app" >/dev/null
 
 shasum -a 256 "$dmg"
-echo "Packaged $dmg ($(du -h "$dmg" | cut -f1))"
+echo "Packaged $dmg, version $version ($(du -h "$dmg" | cut -f1))"
