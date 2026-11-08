@@ -175,10 +175,21 @@ public actor GoogleAuth {
     }
 
     static let successPage = """
-        <!doctype html><meta charset="utf-8"><title>StreamDisk</title>
-        <body style="font:16px -apple-system,system-ui;display:grid;place-items:center;height:90vh;color:#222">
-        <div style="text-align:center"><h2 style="font-weight:600">Signed in to StreamDisk</h2>
-        <p style="color:#666">You can close this tab.</p></div></body>
+        <!doctype html><html lang="en"><meta charset="utf-8"><title>Signed in to StreamDisk</title>
+        <meta name="color-scheme" content="light dark">
+        <style>
+        :root{--bg:#F4F1EC;--card:#FFFDFA;--ink:#2A2520;--soft:rgba(42,37,32,.6);--line:rgba(42,37,32,.09);--accent:#D47A1F}
+        @media (prefers-color-scheme:dark){:root{--bg:#1C1A17;--card:#26231F;--ink:#F3EEE7;--soft:rgba(243,238,231,.6);--line:rgba(243,238,231,.08);--accent:#E8923A}}
+        body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--ink);
+        font:15px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif}
+        .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:40px 48px;text-align:center;max-width:360px}
+        .mark{width:44px;height:44px;margin:0 auto 20px;border-radius:50%;border:4px solid var(--line);
+        border-top-color:var(--accent);border-right-color:var(--accent);box-sizing:border-box;position:relative}
+        .mark:after{content:"";position:absolute;inset:50%;width:8px;height:8px;margin:-4px;border-radius:50%;background:var(--accent)}
+        h1{font-size:20px;font-weight:600;margin:0 0 6px}p{margin:0;color:var(--soft)}
+        </style>
+        <div class="card"><div class="mark"></div><h1>You're signed in</h1>
+        <p>Go back to StreamDisk. You can close this tab.</p></div></html>
         """
 }
 
