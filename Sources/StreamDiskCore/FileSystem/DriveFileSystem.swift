@@ -54,6 +54,10 @@ public actor DriveFileSystem: WritableFileSystemBackend {
     private var materializing: [UInt64: Task<String, Error>] = [:]
     private var pending: [UInt64: Pending] = [:]
     private var quota: (value: DriveQuota, fetched: Date)?
+    /// Recent reads per file, for the streaming rate shown in the app.
+    private var reads: [UInt64: [(at: Date, bytes: Int)]] = [:]
+    /// Bytes the server has confirmed for uploads in progress.
+    private var uploadSent: [UInt64: UInt64] = [:]
 
     /// - Parameters:
     ///   - stateDirectory: Holds the staging files and the journal.
@@ -128,7 +132,9 @@ public actor DriveFileSystem: WritableFileSystemBackend {
         guard !remote.isFolder else { throw NFSStatus.isdir }
         let file = RemoteFile(id: remote.id, version: Self.version(of: remote), size: remote.size)
         do {
-            return try await reader.read(file, offset: offset, count: count)
+            let bytes = try await reader.read(file, offset: offset, count: count)
+            recordRead(id, bytes: bytes.count)
+            return bytes
         } catch {
             log.error("read \(node.name, privacy: .public) @\(offset) failed: \(String(describing: error), privacy: .public)")
             throw Self.status(for: error)
@@ -331,6 +337,7 @@ public actor DriveFileSystem: WritableFileSystemBackend {
             await uploads.cancel(id)
             staging.delete(p.staging)
             pending[id] = nil
+            uploadSent[id] = nil
             saveJournal()
         }
         if let remote = nodes[id]?.remote {
@@ -347,9 +354,10 @@ public actor DriveFileSystem: WritableFileSystemBackend {
         let target: DriveClient.UploadTarget = p.driveID.map { .replace(fileID: $0) }
             ?? .new(name: Self.driveName(p.name), parentID: p.parentDriveID)
         log.info("uploading \(p.name, privacy: .public)")
+        uploadSent[id] = 0
         let file = try await drive.upload(staging.url(p.staging), to: target, modified: p.modified, session: p.session,
                                           onSession: { [weak self] url in Task { await self?.setSession(id, url) } },
-                                          progress: { _, _ in })
+                                          progress: { [weak self] sent, _ in Task { await self?.setSent(id, sent) } })
         try Task.checkCancellation()
         guard let current = pending[id], current.staging == p.staging else {
             // Deleted while the last bytes were in flight: don't leave the upload behind.
@@ -357,11 +365,17 @@ public actor DriveFileSystem: WritableFileSystemBackend {
             return
         }
         pending[id] = nil
+        uploadSent[id] = nil
         staging.delete(p.staging)
         saveJournal()
         idByDriveID[file.id] = id
         nodes[id]?.remote = file
         log.info("uploaded \(p.name, privacy: .public)")
+    }
+
+    private func setSent(_ id: UInt64, _ sent: UInt64) {
+        guard pending[id] != nil else { return }
+        uploadSent[id] = sent
     }
 
     private func setSession(_ id: UInt64, _ url: URL) {
@@ -375,6 +389,56 @@ public actor DriveFileSystem: WritableFileSystemBackend {
         } catch {
             log.error("could not save upload journal: \(String(describing: error), privacy: .public)")
         }
+    }
+
+    // MARK: Activity
+
+    /// What the file system is doing right now, for the app's status UI.
+    public struct Activity: Sendable, Equatable {
+        public struct Stream: Sendable, Equatable {
+            public let name: String
+            public let bytesPerSecond: UInt64
+        }
+        public struct Upload: Sendable, Equatable {
+            public let name: String
+            public let sent: UInt64
+            public let total: UInt64
+        }
+        /// Files being read, fastest first.
+        public var streams: [Stream] = []
+        /// Files waiting to upload or uploading, by name.
+        public var uploads: [Upload] = []
+    }
+
+    /// A file counts as streaming while it has been read within this window.
+    static let rateWindow: TimeInterval = 3
+
+    public func activity(now: Date = Date()) -> Activity {
+        var result = Activity()
+        for id in Array(reads.keys) {
+            pruneReads(id, now: now)
+            guard let window = reads[id], let name = nodes[id]?.name else { continue }
+            let bytes = window.reduce(0) { $0 + $1.bytes }
+            result.streams.append(.init(name: name, bytesPerSecond: UInt64(Double(bytes) / Self.rateWindow)))
+        }
+        result.streams.sort { $0.bytesPerSecond > $1.bytesPerSecond }
+        for (id, p) in pending where !p.localOnly {
+            let total = (try? staging.size(p.staging)) ?? 0
+            result.uploads.append(.init(name: p.name, sent: min(uploadSent[id] ?? 0, total), total: total))
+        }
+        result.uploads.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        return result
+    }
+
+    private func recordRead(_ id: UInt64, bytes: Int) {
+        let now = Date()
+        reads[id, default: []].append((now, bytes))
+        pruneReads(id, now: now)
+    }
+
+    private func pruneReads(_ id: UInt64, now: Date) {
+        reads[id]?.removeAll { now.timeIntervalSince($0.at) > Self.rateWindow }
+        if reads[id]?.isEmpty == true { reads[id] = nil }
     }
 
     // MARK: Listings
